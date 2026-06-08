@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-keepalive"
+version = "0.3.0"
+description = "Keep remote coding-agent sessions observable and alive on long-lived hosts."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+license = "MIT"
+keywords = ["codex", "claude-code", "agents", "systemd", "keepalive"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+
+[project.scripts]
+agent-keepalive = "agent_keepalive.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/hrokling/agent-keepalive"
+Issues = "https://github.com/hrokling/agent-keepalive/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

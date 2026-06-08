@@ -1,0 +1,17 @@
+[Unit]
+Description=Agent keepalive for %i
+After=default.target
+
+[Service]
+Type=simple
+Environment=AGENT_KEEPALIVE_PROVIDER=codex
+Environment=AGENT_KEEPALIVE_IDLE_TIMEOUT=1h
+Environment=AGENT_KEEPALIVE_CODEX_SOCKET=%h/.codex/app-server-control/app-server-control.sock
+Environment=AGENT_KEEPALIVE_CLAUDE_BIN=claude
+Environment=AGENT_KEEPALIVE_CLAUDE_CWD=
+ExecStart=/bin/sh -lc 'target="%i"; provider="$${AGENT_KEEPALIVE_PROVIDER}"; case "$$target" in codex:*) provider=codex; target="$${target#codex:}" ;; claude:*) provider=claude; target="$${target#claude:}" ;; esac; if [ "$$provider" = "claude" ]; then if [ "$$target" = "all" ]; then if [ -n "$${AGENT_KEEPALIVE_CLAUDE_CWD}" ]; then exec agent-keepalive run claude --all --cwd "$${AGENT_KEEPALIVE_CLAUDE_CWD}" --claude-bin "$${AGENT_KEEPALIVE_CLAUDE_BIN}" --idle-timeout "$${AGENT_KEEPALIVE_IDLE_TIMEOUT}"; else exec agent-keepalive run claude --all --claude-bin "$${AGENT_KEEPALIVE_CLAUDE_BIN}" --idle-timeout "$${AGENT_KEEPALIVE_IDLE_TIMEOUT}"; fi; else if [ -n "$${AGENT_KEEPALIVE_CLAUDE_CWD}" ]; then exec agent-keepalive run claude --session "$$target" --cwd "$${AGENT_KEEPALIVE_CLAUDE_CWD}" --claude-bin "$${AGENT_KEEPALIVE_CLAUDE_BIN}" --idle-timeout "$${AGENT_KEEPALIVE_IDLE_TIMEOUT}"; else exec agent-keepalive run claude --session "$$target" --claude-bin "$${AGENT_KEEPALIVE_CLAUDE_BIN}" --idle-timeout "$${AGENT_KEEPALIVE_IDLE_TIMEOUT}"; fi; fi; else exec agent-keepalive run codex --thread "$$target" --socket "$${AGENT_KEEPALIVE_CODEX_SOCKET}" --idle-timeout "$${AGENT_KEEPALIVE_IDLE_TIMEOUT}"; fi'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
