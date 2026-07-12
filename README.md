@@ -66,10 +66,26 @@ agent-keepalive start codex \
 Codex keeps a thread alive by:
 
 1. Connects to the local Codex app-server control socket.
-2. Performs the normal `initialize` + `initialized` handshake.
-3. Calls `thread/resume` to attach as a subscriber.
-4. Tracks thread activity and status notifications.
-5. Calls `thread/unsubscribe` and exits after the configured idle timeout.
+2. Runs a Codex app-server version preflight before it selects or resumes a thread.
+3. If the socket is serving an older app-server than the local Codex CLI / managed version, it tries a safe recovery first.
+4. Performs the normal `initialize` + `initialized` handshake.
+5. Calls `thread/resume` to attach as a subscriber.
+6. Tracks thread activity and status notifications.
+7. Calls `thread/unsubscribe` and exits after the configured idle timeout.
+
+Codex stale-server recovery works like this:
+
+1. Runs `codex app-server daemon version` and parses the JSON output.
+2. Probes the exact target socket with the normal `initialize` handshake and extracts the running app-server version.
+3. If the socket is current, keepalive attaches normally.
+4. If the socket is stale, keepalive first tries `codex app-server daemon restart`.
+5. If restart fails because an unmanaged `codex ... app-server --listen` process is holding the daemon socket, keepalive finds the process that owns that exact unix-socket inode, verifies that its command line matches a Codex app-server listener, stops only that process, and retries the daemon restart.
+6. If the socket still does not come back on the expected version, or if the process/socket ownership is ambiguous, keepalive exits with a clear error instead of attaching to stale state.
+
+Limitations:
+
+- Automatic recovery only applies to the daemon-managed Codex socket. If you point keepalive at a different custom socket and it is stale, keepalive fails loudly instead of trying to restart an unrelated server.
+- The unmanaged fallback assumes the stale listener is a `codex ... app-server --listen` process for the exact socket path. If that assumption cannot be proved from `/proc`, recovery is refused.
 
 ## Claude Code usage
 
@@ -206,6 +222,8 @@ Environment=AGENT_KEEPALIVE_PROVIDER=codex
 Environment=AGENT_KEEPALIVE_CODEX_SOCKET=/home/you/.codex/app-server-control/desktop-ssh-websocket-v0.sock
 Environment=AGENT_KEEPALIVE_IDLE_TIMEOUT=1h
 ```
+
+When a systemd-managed Codex keeper restarts after a connection failure, it runs the same preflight again before reattaching, so a local Codex CLI upgrade does not leave the keeper bound to an older app-server indefinitely.
 
 To allow user services to run after logout and start without an interactive login:
 
