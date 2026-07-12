@@ -67,6 +67,9 @@ Key dependencies:
 
 - websocket-over-unix-socket transport
 - Codex JSON-RPC methods such as `thread/resume` and `thread/unsubscribe`
+- `codex app-server daemon version` for daemon-managed version checks and stale-server recovery
+
+Before selecting or resuming a thread, the Codex path verifies that the app-server behind the target socket is on the expected local Codex version. If the daemon socket is stale, it first tries a normal daemon restart and only falls back to stopping a single unmanaged `codex ... app-server --listen` listener when that exact process can be proven to own the stale socket. If recovery is ambiguous or unsuccessful, the provider fails loudly instead of attaching to stale server state.
 
 ### Claude Code
 

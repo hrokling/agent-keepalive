@@ -3,18 +3,18 @@ from __future__ import annotations
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
-import time
 from typing import Any
 
 from ..activity import ThreadActivityTracker
 from ..app_server import AppServerClient
 from ..paths import default_socket_path
 from ..state import KeeperRecord
-from ..timeparse import isoformat_or_none
 from ..timeparse import utc_now
 from .base import ResolvedTarget
 from .base import RunConfig
 from .base import Snapshot
+from .codex_recovery import CodexAppServerState
+from .codex_recovery import ensure_current_codex_app_server
 
 
 def discover_socket_path(configured: str | None = None) -> Path:
@@ -35,6 +35,7 @@ class CodexProvider:
 
     def resolve(self, args) -> ResolvedTarget:
         socket_path = discover_socket_path(getattr(args, "socket", None))
+        ensure_current_codex_app_server(socket_path)
         with managed_client(socket_path) as client:
             if getattr(args, "last", False):
                 thread = select_recent_thread(client)
@@ -86,9 +87,11 @@ class CodexSession:
         self.socket_path = socket_path
         self.client = AppServerClient(str(socket_path))
         self.tracker = ThreadActivityTracker(thread_id)
-        self.last_snapshot = snapshot_from_tracker(thread_id, self.tracker, {"socket_path": str(socket_path)})
+        self.app_server_state: CodexAppServerState | None = None
+        self.last_snapshot = snapshot_from_tracker(thread_id, self.tracker, self._metadata())
 
     def attach(self) -> Snapshot:
+        self.app_server_state = ensure_current_codex_app_server(self.socket_path)
         self.client.connect()
         resume = self.client.resume_thread(self.thread_id)
         thread = resume["thread"]
@@ -96,7 +99,7 @@ class CodexSession:
         self.last_snapshot = snapshot_from_tracker(
             self.thread_id,
             self.tracker,
-            {"socket_path": str(self.socket_path)},
+            self._metadata(),
         )
         return self.last_snapshot
 
@@ -112,7 +115,7 @@ class CodexSession:
         self.last_snapshot = snapshot_from_tracker(
             self.thread_id,
             self.tracker,
-            {"socket_path": str(self.socket_path)},
+            self._metadata(),
         )
         return self.last_snapshot
 
@@ -124,6 +127,17 @@ class CodexSession:
 
     def close(self) -> None:
         self.client.close()
+
+    def _metadata(self) -> dict[str, object]:
+        metadata: dict[str, object] = {"socket_path": str(self.socket_path)}
+        if self.app_server_state is None:
+            return metadata
+        metadata["cli_version"] = self.app_server_state.cli_version
+        metadata["managed_codex_version"] = self.app_server_state.managed_codex_version
+        metadata["app_server_version"] = self.app_server_state.app_server_version
+        metadata["app_server_expected_version"] = self.app_server_state.expected_version
+        metadata["app_server_recovery_action"] = self.app_server_state.recovery_action
+        return metadata
 
 
 def snapshot_from_tracker(

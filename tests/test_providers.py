@@ -4,6 +4,7 @@ from datetime import timedelta
 import tempfile
 import unittest
 from pathlib import Path
+import subprocess
 from unittest import mock
 
 from agent_keepalive.cli import build_parser
@@ -13,6 +14,10 @@ from agent_keepalive.providers.claude import select_last_state
 from agent_keepalive.providers.claude import short_session_id
 from agent_keepalive.providers.claude import status_from_payload
 from agent_keepalive.providers.codex import select_recent_thread
+from agent_keepalive.providers.codex_recovery import CodexRecoveryError
+from agent_keepalive.providers.codex_recovery import classify_version_state
+from agent_keepalive.providers.codex_recovery import ensure_current_codex_app_server
+from agent_keepalive.providers.codex_recovery import parse_daemon_version
 from agent_keepalive.providers.base import RunConfig
 from agent_keepalive.state import KeeperRecord
 from agent_keepalive.state import StateStore
@@ -88,6 +93,129 @@ class CodexProviderTests(unittest.TestCase):
                 ]
 
         self.assertEqual(select_recent_thread(Client())["id"], "older-loaded")
+
+
+class CodexRecoveryTests(unittest.TestCase):
+    def test_parse_daemon_version_reads_machine_output(self) -> None:
+        daemon = parse_daemon_version(
+            """
+            {
+              "status": "running",
+              "socketPath": "/tmp/codex.sock",
+              "cliVersion": "0.144.1",
+              "managedCodexVersion": "0.144.1",
+              "appServerVersion": "0.142.0"
+            }
+            """
+        )
+        self.assertEqual(daemon.status, "running")
+        self.assertEqual(daemon.socket_path, Path("/tmp/codex.sock"))
+        self.assertEqual(daemon.cli_version, "0.144.1")
+        self.assertEqual(daemon.managed_codex_version, "0.144.1")
+        self.assertEqual(daemon.app_server_version, "0.142.0")
+
+    def test_classify_version_state_detects_stale_server(self) -> None:
+        self.assertEqual(classify_version_state("0.144.1", "0.144.1"), "current")
+        self.assertEqual(classify_version_state("0.142.0", "0.144.1"), "stale")
+        with self.assertRaises(CodexRecoveryError):
+            classify_version_state("0.145.0", "0.144.1")
+
+    @mock.patch("agent_keepalive.providers.codex_recovery.probe_socket_app_server_version")
+    @mock.patch("agent_keepalive.providers.codex_recovery.run_codex_command")
+    def test_ensure_current_accepts_current_server(self, run_codex_command, probe_version) -> None:
+        run_codex_command.return_value = subprocess.CompletedProcess(
+            args=["codex", "app-server", "daemon", "version"],
+            returncode=0,
+            stdout=(
+                '{"status":"running","socketPath":"/tmp/codex.sock","cliVersion":"0.144.1",'
+                '"managedCodexVersion":"0.144.1","appServerVersion":"0.144.1"}'
+            ),
+            stderr="",
+        )
+        probe_version.return_value = "0.144.1"
+
+        state = ensure_current_codex_app_server(Path("/tmp/codex.sock"))
+
+        self.assertEqual(state.expected_version, "0.144.1")
+        self.assertEqual(state.app_server_version, "0.144.1")
+        self.assertEqual(state.recovery_action, "none")
+        self.assertEqual(run_codex_command.call_count, 1)
+
+    @mock.patch("agent_keepalive.providers.codex_recovery.probe_socket_app_server_version")
+    @mock.patch("agent_keepalive.providers.codex_recovery.run_codex_command")
+    def test_ensure_current_refuses_stale_custom_socket(self, run_codex_command, probe_version) -> None:
+        run_codex_command.return_value = subprocess.CompletedProcess(
+            args=["codex", "app-server", "daemon", "version"],
+            returncode=0,
+            stdout=(
+                '{"status":"running","socketPath":"/tmp/daemon.sock","cliVersion":"0.144.1",'
+                '"managedCodexVersion":"0.144.1","appServerVersion":"0.144.1"}'
+            ),
+            stderr="",
+        )
+        probe_version.return_value = "0.142.0"
+
+        with self.assertRaises(CodexRecoveryError):
+            ensure_current_codex_app_server(Path("/tmp/custom.sock"))
+
+        self.assertEqual(run_codex_command.call_count, 1)
+
+    @mock.patch("agent_keepalive.providers.codex_recovery.terminate_process")
+    @mock.patch("agent_keepalive.providers.codex_recovery.find_codex_listener_pid")
+    @mock.patch("agent_keepalive.providers.codex_recovery.probe_socket_app_server_version")
+    @mock.patch("agent_keepalive.providers.codex_recovery.run_codex_command")
+    def test_ensure_current_recovers_unmanaged_stale_server(
+        self,
+        run_codex_command,
+        probe_version,
+        find_listener_pid,
+        terminate_process,
+    ) -> None:
+        daemon_json = (
+            '{"status":"running","socketPath":"/tmp/codex.sock","cliVersion":"0.144.1",'
+            '"managedCodexVersion":"0.144.1","appServerVersion":"0.142.0"}'
+        )
+        current_json = (
+            '{"status":"running","socketPath":"/tmp/codex.sock","cliVersion":"0.144.1",'
+            '"managedCodexVersion":"0.144.1","appServerVersion":"0.144.1"}'
+        )
+        run_codex_command.side_effect = [
+            subprocess.CompletedProcess(
+                args=["codex", "app-server", "daemon", "version"],
+                returncode=0,
+                stdout=daemon_json,
+                stderr="",
+            ),
+            subprocess.CompletedProcess(
+                args=["codex", "app-server", "daemon", "restart"],
+                returncode=1,
+                stdout="",
+                stderr="app server is running but is not managed by codex app-server daemon",
+            ),
+            subprocess.CompletedProcess(
+                args=["codex", "app-server", "daemon", "restart"],
+                returncode=0,
+                stdout="",
+                stderr="",
+            ),
+            subprocess.CompletedProcess(
+                args=["codex", "app-server", "daemon", "version"],
+                returncode=0,
+                stdout=current_json,
+                stderr="",
+            ),
+        ]
+        probe_version.side_effect = ["0.142.0", "0.144.1"]
+        find_listener_pid.return_value = 4242
+        terminate_process.return_value = "sigterm"
+
+        state = ensure_current_codex_app_server(Path("/tmp/codex.sock"))
+
+        self.assertEqual(state.app_server_version, "0.144.1")
+        self.assertEqual(state.recovery_action, "stop_unmanaged_listener_sigterm_then_daemon_restart")
+        find_listener_pid.assert_called_once_with(Path("/tmp/codex.sock"))
+        terminate_process.assert_called_once_with(4242)
+        self.assertEqual(run_codex_command.call_count, 4)
 
 
 class ClaudeProviderTests(unittest.TestCase):
