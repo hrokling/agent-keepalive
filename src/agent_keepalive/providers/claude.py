@@ -192,6 +192,45 @@ def preflight_claude(claude_bin: str, *, config_dir: Path | None = None) -> Clau
 def observe_claude(*, preflight: ClaudePreflight, short_id: str, cwd: Path) -> Snapshot:
     state = load_state(preflight.config_dir, short_id)
     live_entry = find_live_entry(preflight.claude_bin, cwd=cwd, short_id=short_id, state=state)
+    return snapshot_from_claude_sources(
+        preflight=preflight,
+        short_id=short_id,
+        cwd=cwd,
+        state=state,
+        live_entry=live_entry,
+    )
+
+
+def observe_claude_entry(
+    *,
+    preflight: ClaudePreflight,
+    short_id: str,
+    cwd: Path,
+    live_entry: dict[str, Any],
+) -> Snapshot:
+    """Observe a session already returned by one discovery poll.
+
+    The discovery supervisor uses this to avoid a second ``claude agents``
+    invocation per session and to make its admission decision from the same
+    live-entry snapshot that selected the session.
+    """
+    return snapshot_from_claude_sources(
+        preflight=preflight,
+        short_id=short_id,
+        cwd=cwd,
+        state=load_state(preflight.config_dir, short_id),
+        live_entry=live_entry,
+    )
+
+
+def snapshot_from_claude_sources(
+    *,
+    preflight: ClaudePreflight,
+    short_id: str,
+    cwd: Path,
+    state: dict[str, Any] | None,
+    live_entry: dict[str, Any] | None,
+) -> Snapshot:
     session_id = value_as_str(state, "sessionId") if state else None
     session_id = value_as_str(live_entry, "sessionId") or session_id
     status = status_from_payload(state, live_entry)
@@ -203,6 +242,8 @@ def observe_claude(*, preflight: ClaudePreflight, short_id: str, cwd: Path) -> S
     in_flight = state.get("inFlight") if isinstance(state, dict) else None
     metadata = {
         "seen": state is not None or live_entry is not None,
+        "state_available": state is not None,
+        "live_entry_available": live_entry is not None,
         "short_session_id": short_id,
         "session_id": session_id,
         "claude_bin": preflight.claude_bin,
