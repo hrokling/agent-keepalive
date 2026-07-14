@@ -52,10 +52,15 @@ It does not monitor one Claude session directly. Instead it:
 
 - polls `claude agents --json`
 - filters to live sessions, optionally by working directory
-- starts one normal Claude keeper per discovered session
+- reads each discovered session's job state from the same discovery snapshot before admission
+- suppresses blocked, terminal, and state-metadata-unavailable sessions rather than starting a child that cannot make progress
+- starts one normal Claude keeper per eligible session, and re-admits a suppressed session when its state becomes usable again
+- applies a 30-second to 5-minute exponential retry only when a child keeper reports an actual error
 - leaves per-session state handling to the generic keeper path
 
-This keeps `--all` as a thin discovery layer rather than a second session-management system.
+Suppression is intentionally different from the generic idle timeout. Claude's `blocked` state represents a prerequisite or a needed reply, not inactivity. A blocked state can remain in `claude agents --json` after its job-file `updatedAt` is older than the child idle timeout; spawning a child in that state causes an immediate clean detach. The supervisor records the suppression reason in its own state and logs only state transitions, avoiding a repeated spawn/detach cycle while still detecting recovery.
+
+This keeps `--all` as a thin discovery layer rather than a second session-management system, while making admission explicit enough to distinguish expected non-runnable states from child failures.
 
 ## Provider model
 

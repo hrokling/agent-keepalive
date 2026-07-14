@@ -115,9 +115,13 @@ Claude monitoring works by:
 
 1. Runs preflight checks with `claude --version`, `claude auth status --text`, and `claude agents --json`.
 2. In `--all` mode, polls `claude agents --json` and starts one keeper per live Claude session it discovers.
-3. For each discovered or explicitly targeted session, reads `~/.claude/jobs/<short-id>/state.json`.
+3. For each discovered session, reads `~/.claude/jobs/<short-id>/state.json` from the same discovery snapshot before starting a child keeper.
 4. Records status, detail, tempo, needs, suggested reply, transcript path, auth state, and cwd.
 5. Exits when a Claude job is terminal, or after the configured idle timeout for non-active states.
+
+In `--all` mode, a `blocked` job is not treated as an idle job. A blocked job is waiting for a Claude prerequisite or reply, so the discovery supervisor records it as suppressed and rechecks it on its normal poll interval instead of repeatedly starting a child that would immediately detach. The same applies while the job state file is unavailable. When the job state becomes eligible (normally `active`), the supervisor logs the transition and starts a keeper again. Terminal entries that remain in `claude agents --json` are recorded as removed from supervision.
+
+If a child keeper itself fails, the supervisor retains the error long enough to report it and retries with exponential backoff from 30 seconds to 5 minutes. Successful child starts clear that retry state. This is separate from suppression, so genuine provider or process failures remain visible.
 
 Claude support is monitor-only. It discovers and adopts live Claude sessions, but it does not invent or relaunch missing ones.
 
