@@ -71,6 +71,8 @@ Key dependencies:
 
 Before selecting or resuming a thread, the Codex path verifies that the app-server behind the target socket is on the expected local Codex version. If the daemon socket is stale, it first tries a normal daemon restart and only falls back to stopping a single unmanaged `codex ... app-server --listen` listener when that exact process can be proven to own the stale socket. If recovery is ambiguous or unsuccessful, the provider fails loudly instead of attaching to stale server state.
 
+Socket-level unavailability during startup is the one temporary exception: the foreground keeper logs the unavailable socket, remains active, and retries with bounded exponential backoff (5 seconds to 5 minutes). Protocol, version, permission, CLI, and other application failures remain fatal.
+
 ### Claude Code
 
 The Claude provider is monitor-only.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
 import json
 import os
 from pathlib import Path
@@ -15,10 +16,29 @@ from ..app_server import AppServerClient
 
 UNMANAGED_RESTART_ERROR = "app server is running but is not managed by codex app-server daemon"
 VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+UNAVAILABLE_SOCKET_ERRNOS = frozenset(
+    {
+        errno.ENOENT,
+        errno.ECONNREFUSED,
+        errno.ECONNRESET,
+        errno.ECONNABORTED,
+        errno.ENOTCONN,
+        errno.EPIPE,
+    }
+)
 
 
 class CodexRecoveryError(RuntimeError):
     pass
+
+
+class CodexAppServerUnavailable(CodexRecoveryError):
+    """Raised when the Codex app-server cannot currently accept a connection."""
+
+    def __init__(self, socket_path: Path, reason: BaseException | str) -> None:
+        self.socket_path = socket_path
+        detail = str(reason) or type(reason).__name__
+        super().__init__(f"Codex app-server unavailable at {socket_path}: {detail}")
 
 
 @dataclass(frozen=True)
@@ -44,9 +64,9 @@ def ensure_current_codex_app_server(
     *,
     codex_bin: str = "codex",
 ) -> CodexAppServerState:
+    app_server_version = probe_socket_app_server_version(socket_path)
     daemon = read_daemon_version(codex_bin)
     expected_version = expected_codex_version(daemon)
-    app_server_version = probe_socket_app_server_version(socket_path)
     validate_daemon_socket_version(daemon, socket_path, app_server_version)
 
     version_state = classify_version_state(app_server_version, expected_version)
@@ -131,7 +151,12 @@ def expected_codex_version(daemon: CodexDaemonVersion) -> str:
 def probe_socket_app_server_version(socket_path: Path) -> str:
     client = AppServerClient(str(socket_path))
     try:
-        initialize_result = client.connect()
+        try:
+            initialize_result = client.connect()
+        except OSError as exc:
+            if is_unavailable_socket_error(exc):
+                raise CodexAppServerUnavailable(socket_path, exc) from exc
+            raise
     finally:
         client.close()
     version = parse_initialize_version(initialize_result)
@@ -140,6 +165,10 @@ def probe_socket_app_server_version(socket_path: Path) -> str:
             f"could not determine Codex app-server version for socket {socket_path} from initialize payload"
         )
     return version
+
+
+def is_unavailable_socket_error(exc: BaseException) -> bool:
+    return isinstance(exc, OSError) and exc.errno in UNAVAILABLE_SOCKET_ERRNOS
 
 
 def parse_initialize_version(payload: dict[str, Any]) -> str | None:
