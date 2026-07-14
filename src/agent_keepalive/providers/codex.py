@@ -13,8 +13,10 @@ from ..timeparse import utc_now
 from .base import ResolvedTarget
 from .base import RunConfig
 from .base import Snapshot
+from .codex_recovery import CodexAppServerUnavailable
 from .codex_recovery import CodexAppServerState
 from .codex_recovery import ensure_current_codex_app_server
+from .codex_recovery import is_unavailable_socket_error
 
 
 def discover_socket_path(configured: str | None = None) -> Path:
@@ -92,8 +94,15 @@ class CodexSession:
 
     def attach(self) -> Snapshot:
         self.app_server_state = ensure_current_codex_app_server(self.socket_path)
-        self.client.connect()
-        resume = self.client.resume_thread(self.thread_id)
+        self.client = AppServerClient(str(self.socket_path))
+        try:
+            self.client.connect()
+            resume = self.client.resume_thread(self.thread_id)
+        except BaseException as exc:  # noqa: BLE001
+            self.client.close()
+            if is_unavailable_socket_error(exc):
+                raise CodexAppServerUnavailable(self.socket_path, exc) from exc
+            raise
         thread = resume["thread"]
         self.tracker.note_thread_snapshot(thread)
         self.last_snapshot = snapshot_from_tracker(

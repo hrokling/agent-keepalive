@@ -12,6 +12,7 @@ from .providers import get_provider
 from .providers.base import RunConfig
 from .providers.base import Snapshot
 from .providers.base import should_detach
+from .providers.codex_recovery import CodexAppServerUnavailable
 from .state import KeeperRecord
 from .state import StateStore
 from .timeparse import isoformat_or_none
@@ -19,6 +20,8 @@ from .timeparse import utc_now
 
 
 PING_INTERVAL = 60.0
+CODEX_APP_SERVER_RETRY_INITIAL_DELAY = 5.0
+CODEX_APP_SERVER_RETRY_MAX_DELAY = 300.0
 
 
 def configure_logger(log_path: Path) -> logging.Logger:
@@ -72,8 +75,12 @@ class Keeper:
             self.config.selected_via,
         )
         try:
-            snapshot = self.session.attach()
+            snapshot = self._attach_with_retry()
+            if snapshot is None:
+                self._graceful_detach()
+                return 0
             self.record.keeper_status = "attached"
+            self.record.last_error = None
             self._apply_snapshot(snapshot)
             self._persist_state()
 
@@ -138,6 +145,38 @@ class Keeper:
             finally:
                 if self.record.keeper_status != "error":
                     self.store.remove(self.config.provider, self.config.target_id)
+
+    def _attach_with_retry(self) -> Snapshot | None:
+        delay = CODEX_APP_SERVER_RETRY_INITIAL_DELAY
+        attempt = 0
+        while not self.stop_requested:
+            try:
+                snapshot = self.session.attach()
+            except CodexAppServerUnavailable as exc:
+                attempt += 1
+                self.record.keeper_status = "waiting_for_codex_app_server"
+                self.record.last_error = str(exc)
+                self._persist_state()
+                message = (
+                    f"{exc}; retrying Codex app-server connection in {delay:g}s "
+                    f"(attempt {attempt})"
+                )
+                self.logger.warning(message)
+                print(f"agent-keepalive warning: {message}", file=sys.stderr, flush=True)
+                self._wait_for_retry(delay)
+                delay = min(delay * 2, CODEX_APP_SERVER_RETRY_MAX_DELAY)
+            else:
+                self.record.last_error = None
+                return snapshot
+        return None
+
+    def _wait_for_retry(self, delay: float) -> None:
+        deadline = time.monotonic() + delay
+        while not self.stop_requested:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 1.0))
 
     def _graceful_detach(self) -> None:
         self.record.keeper_status = "stopping"

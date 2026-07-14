@@ -14,10 +14,12 @@ from agent_keepalive.providers.claude import select_last_state
 from agent_keepalive.providers.claude import short_session_id
 from agent_keepalive.providers.claude import status_from_payload
 from agent_keepalive.providers.codex import select_recent_thread
+from agent_keepalive.providers.codex_recovery import CodexAppServerUnavailable
 from agent_keepalive.providers.codex_recovery import CodexRecoveryError
 from agent_keepalive.providers.codex_recovery import classify_version_state
 from agent_keepalive.providers.codex_recovery import ensure_current_codex_app_server
 from agent_keepalive.providers.codex_recovery import parse_daemon_version
+from agent_keepalive.providers.codex_recovery import probe_socket_app_server_version
 from agent_keepalive.providers.base import RunConfig
 from agent_keepalive.state import KeeperRecord
 from agent_keepalive.state import StateStore
@@ -96,6 +98,38 @@ class CodexProviderTests(unittest.TestCase):
 
 
 class CodexRecoveryTests(unittest.TestCase):
+    @mock.patch("agent_keepalive.providers.codex_recovery.AppServerClient")
+    def test_probe_classifies_connection_refused_as_unavailable(self, app_server_client) -> None:
+        app_server_client.return_value.connect.side_effect = ConnectionRefusedError(
+            111,
+            "Connection refused",
+        )
+
+        with self.assertRaises(CodexAppServerUnavailable) as context:
+            probe_socket_app_server_version(Path("/tmp/codex.sock"))
+
+        self.assertEqual(context.exception.socket_path, Path("/tmp/codex.sock"))
+        self.assertIn("Codex app-server unavailable", str(context.exception))
+        app_server_client.return_value.close.assert_called_once_with()
+
+    def test_missing_socket_is_classified_before_daemon_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            socket_path = Path(temp_dir) / "missing.sock"
+            with mock.patch("agent_keepalive.providers.codex_recovery.run_codex_command") as run_command:
+                with self.assertRaises(CodexAppServerUnavailable):
+                    ensure_current_codex_app_server(socket_path)
+                run_command.assert_not_called()
+
+    @mock.patch("agent_keepalive.providers.codex_recovery.AppServerClient")
+    def test_probe_does_not_retry_permission_errors(self, app_server_client) -> None:
+        app_server_client.return_value.connect.side_effect = PermissionError(
+            13,
+            "Permission denied",
+        )
+
+        with self.assertRaises(PermissionError):
+            probe_socket_app_server_version(Path("/tmp/codex.sock"))
+
     def test_parse_daemon_version_reads_machine_output(self) -> None:
         daemon = parse_daemon_version(
             """

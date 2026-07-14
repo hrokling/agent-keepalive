@@ -28,34 +28,38 @@ class UnixWebSocket:
 
     def connect(self) -> None:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(self.connect_timeout)
-        sock.connect(self.socket_path)
+        try:
+            sock.settimeout(self.connect_timeout)
+            sock.connect(self.socket_path)
 
-        key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
-        request = (
-            "GET / HTTP/1.1\r\n"
-            "Host: localhost\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\n"
-            "Sec-WebSocket-Version: 13\r\n"
-            "\r\n"
-        ).encode("ascii")
-        sock.sendall(request)
+            key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+            request = (
+                "GET / HTTP/1.1\r\n"
+                "Host: localhost\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                "\r\n"
+            ).encode("ascii")
+            sock.sendall(request)
 
-        response = self._read_http_response(sock)
-        if b"101 Switching Protocols" not in response:
-            raise RuntimeError(f"websocket handshake failed: {response!r}")
+            response = self._read_http_response(sock)
+            if b"101 Switching Protocols" not in response:
+                raise RuntimeError(f"websocket handshake failed: {response!r}")
 
-        accept = self._extract_header(response, "Sec-WebSocket-Accept")
-        expected = base64.b64encode(hashlib.sha1(f"{key}{Guid}".encode("ascii")).digest()).decode(
-            "ascii"
-        )
-        if accept != expected:
-            raise RuntimeError("websocket accept header did not match request key")
+            accept = self._extract_header(response, "Sec-WebSocket-Accept")
+            expected = base64.b64encode(hashlib.sha1(f"{key}{Guid}".encode("ascii")).digest()).decode(
+                "ascii"
+            )
+            if accept != expected:
+                raise RuntimeError("websocket accept header did not match request key")
 
-        sock.settimeout(None)
-        self._sock = sock
+            sock.settimeout(None)
+            self._sock = sock
+        except BaseException:
+            sock.close()
+            raise
 
     def send_text(self, message: str) -> None:
         self._send_frame(0x1, message.encode("utf-8"))
