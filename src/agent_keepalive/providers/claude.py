@@ -14,7 +14,6 @@ from typing import Any
 
 from ..state import KeeperRecord
 from ..timeparse import parse_timestamp
-from ..timeparse import utc_now
 from .base import ResolvedTarget
 from .base import RunConfig
 from .base import Snapshot
@@ -27,6 +26,7 @@ VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+MAX_JOB_STATE_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -38,12 +38,28 @@ class ClaudePreflight:
     config_dir: Path
 
 
+@dataclass(frozen=True)
+class ClaudeDiscoveryResult:
+    outcome: str
+    entries: list[dict[str, Any]]
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class JobStateResult:
+    outcome: str
+    payload: dict[str, Any] | None
+
+
 class ClaudeProvider:
     name = "claude"
 
     def resolve(self, args) -> ResolvedTarget:
         if getattr(args, "all", False):
-            preflight = preflight_claude(getattr(args, "claude_bin", "claude"))
+            roots = configured_roots(getattr(args, "config_root", None))
+            preflight = preflight_claude(
+                getattr(args, "claude_bin", "claude"), config_dir=roots[0]
+            )
             cwd = Path(getattr(args, "cwd", "")).expanduser().resolve() if getattr(args, "cwd", None) else None
             return ResolvedTarget(
                 provider=self.name,
@@ -54,13 +70,14 @@ class ClaudeProvider:
                     "mode": "all",
                     "claude_bin": preflight.claude_bin,
                     "claude_version": preflight.version,
-                    "auth_method": preflight.auth_method,
-                    "auth_error": preflight.auth_error,
-                    "config_dir": str(preflight.config_dir),
+                    "config_roots": [str(root) for root in roots],
                     "cwd": str(cwd) if cwd is not None else "",
                 },
             )
-        preflight = preflight_claude(getattr(args, "claude_bin", "claude"))
+        roots = configured_roots(getattr(args, "config_root", None))
+        preflight = preflight_claude(
+            getattr(args, "claude_bin", "claude"), config_dir=roots[0]
+        )
         cwd = Path(getattr(args, "cwd", "") or os.getcwd()).resolve()
         if getattr(args, "last", False):
             state = select_last_state(preflight.config_dir, cwd=cwd)
@@ -107,23 +124,24 @@ class ClaudeProvider:
     def live_view(self, records: list[KeeperRecord]) -> dict[str, Snapshot]:
         result: dict[str, Snapshot] = {}
         for record in records:
+            if (
+                record.provider_metadata.get("managed_by_supervisor")
+                or record.target_id == "all"
+                or record.provider_metadata.get("mode") == "all"
+            ):
+                result[record.target_id] = snapshot_from_record(record)
+                continue
             claude_bin = str(record.provider_metadata.get("claude_bin", "claude"))
             config_dir = Path(str(record.provider_metadata.get("config_dir", Path.home() / ".claude")))
             cwd_value = str(record.provider_metadata.get("cwd", ""))
             cwd = Path(cwd_value).resolve() if cwd_value else None
             try:
                 preflight = preflight_claude(claude_bin, config_dir=config_dir)
-                if str(record.provider_metadata.get("mode")) == "all" or record.target_id == "all":
-                    result[record.target_id] = observe_claude_supervisor(
-                        preflight=preflight,
-                        cwd=cwd,
-                    )
-                else:
-                    result[record.target_id] = observe_claude(
-                        preflight=preflight,
-                        short_id=record.target_id,
-                        cwd=cwd or Path(os.getcwd()).resolve(),
-                    )
+                result[record.target_id] = observe_claude(
+                    preflight=preflight,
+                    short_id=record.target_id,
+                    cwd=cwd or Path(os.getcwd()).resolve(),
+                )
             except Exception:
                 result[record.target_id] = snapshot_from_record(record)
         return result
@@ -164,28 +182,25 @@ class ClaudeSession:
 
 def preflight_claude(claude_bin: str, *, config_dir: Path | None = None) -> ClaudePreflight:
     resolved = shutil.which(claude_bin) or claude_bin
-    version_result = run_cli([resolved, "--version"], cwd=Path.cwd())
+    configured = config_dir or Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+    configured = configured.expanduser().resolve()
+    version_result = run_cli(
+        [resolved, "--version"],
+        cwd=Path.cwd(),
+        env=minimal_claude_environment(configured, claude_bin=resolved),
+    )
     if version_result.returncode != 0:
-        raise RuntimeError(f"`{resolved} --version` failed: {command_error_text(version_result)}")
+        raise RuntimeError(f"Claude version check failed with exit code {version_result.returncode}")
     version = parse_version(version_result.stdout or version_result.stderr)
     if version_tuple(version) < MIN_VERSION:
         raise RuntimeError(f"Claude Code {version} is too old; require at least 2.1.139")
 
-    auth_method: str | None = None
-    auth_error: str | None = None
-    auth_result = run_cli([resolved, "auth", "status", "--text"], cwd=Path.cwd())
-    if auth_result.returncode == 0:
-        auth_method = parse_auth_method(auth_result.stdout)
-    else:
-        auth_error = command_error_text(auth_result)
-
-    configured = config_dir or Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
     return ClaudePreflight(
         claude_bin=resolved,
         version=version,
-        auth_method=auth_method,
-        auth_error=auth_error,
-        config_dir=configured.expanduser().resolve(),
+        auth_method=None,
+        auth_error=None,
+        config_dir=configured,
     )
 
 
@@ -225,41 +240,43 @@ def observe_claude_entry(
 
 def snapshot_from_claude_sources(
     *,
-    preflight: ClaudePreflight,
+    preflight: ClaudePreflight | None,
     short_id: str,
     cwd: Path,
     state: dict[str, Any] | None,
     live_entry: dict[str, Any] | None,
+    state_outcome: str = "ok",
+    config_dir: Path | None = None,
+    claude_bin: str | None = None,
 ) -> Snapshot:
+    effective_config_dir = preflight.config_dir if preflight is not None else config_dir
+    effective_claude_bin = preflight.claude_bin if preflight is not None else (claude_bin or "claude")
+    effective_version = preflight.version if preflight is not None else None
     session_id = value_as_str(state, "sessionId") if state else None
     session_id = value_as_str(live_entry, "sessionId") or session_id
-    status = status_from_payload(state, live_entry)
-    updated_at = parse_timestamp(value_as_str(state, "updatedAt")) if state else None
-    last_activity_at = updated_at or utc_now()
+    if state_outcome == "invalid":
+        status = "state_invalid"
+    elif state_outcome == "missing" and live_entry is not None:
+        status = "state_missing"
+    else:
+        status = status_from_payload(state, live_entry)
+    updated_at = safe_parse_timestamp(value_as_str(state, "updatedAt")) if state else None
+    last_activity_at = updated_at
     terminal = status in TERMINAL_STATES
     blocked = status == "blocked"
-    display_name = value_as_str(state, "name") or value_as_str(live_entry, "name") or session_id or short_id
-    in_flight = state.get("inFlight") if isinstance(state, dict) else None
+    display_name = session_id or short_id
     metadata = {
         "seen": state is not None or live_entry is not None,
         "state_available": state is not None,
         "live_entry_available": live_entry is not None,
         "short_session_id": short_id,
         "session_id": session_id,
-        "claude_bin": preflight.claude_bin,
-        "claude_version": preflight.version,
-        "auth_method": preflight.auth_method,
-        "auth_error": preflight.auth_error,
-        "config_dir": str(preflight.config_dir),
+        "claude_bin": effective_claude_bin,
+        "claude_version": effective_version,
+        "config_dir": str(effective_config_dir) if effective_config_dir else "",
         "cwd": str(cwd),
-        "detail": value_as_str(state, "detail"),
-        "tempo": value_as_str(state, "tempo"),
-        "needs": value_as_str(state, "needs"),
-        "suggested_reply": value_as_str(state, "suggestedReply"),
-        "transcript_path": value_as_str(state, "linkScanPath"),
         "live_status": value_as_str(live_entry, "status"),
         "state_age_seconds": state_age_seconds(value_as_str(state, "updatedAt")),
-        "in_flight": in_flight if isinstance(in_flight, dict) else None,
     }
     return Snapshot(
         target_id=short_id,
@@ -276,33 +293,6 @@ def snapshot_from_claude_sources(
     )
 
 
-def observe_claude_supervisor(*, preflight: ClaudePreflight, cwd: Path | None) -> Snapshot:
-    live_entries = list_live_entries(preflight.claude_bin, cwd=cwd)
-    return Snapshot(
-        target_id="all",
-        display_name="all Claude sessions",
-        status="active" if live_entries else "idle",
-        loaded=True,
-        blocked=False,
-        terminal=False,
-        last_activity_at=utc_now(),
-        last_event_at=utc_now(),
-        idle_since=None,
-        event_count=len(live_entries),
-        metadata={
-            "mode": "all",
-            "seen": True,
-            "claude_bin": preflight.claude_bin,
-            "claude_version": preflight.version,
-            "auth_method": preflight.auth_method,
-            "auth_error": preflight.auth_error,
-            "config_dir": str(preflight.config_dir),
-            "cwd": str(cwd) if cwd is not None else "",
-            "live_sessions": len(live_entries),
-        },
-    )
-
-
 def status_from_payload(
     state: dict[str, Any] | None,
     live_entry: dict[str, Any] | None,
@@ -311,8 +301,7 @@ def status_from_payload(
     live_status = value_as_str(live_entry, "status")
     if state_name in TERMINAL_STATES or state_name == "blocked":
         return state_name
-    in_flight = state.get("inFlight") if isinstance(state, dict) else None
-    if isinstance(in_flight, dict) and int(in_flight.get("tasks", 0) or 0) > 0:
+    if in_flight_tasks(state) > 0:
         return "active"
     if live_status in ACTIVE_STATES:
         return "active"
@@ -343,20 +332,81 @@ def find_live_entry(
 
 
 def list_live_entries(claude_bin: str, *, cwd: Path | None) -> list[dict[str, Any]]:
+    config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).resolve()
+    return discover_claude(claude_bin, config_dir=config_dir, cwd=cwd).entries
+
+
+def discover_claude(
+    claude_bin: str,
+    *,
+    config_dir: Path,
+    cwd: Path | None,
+) -> ClaudeDiscoveryResult:
     command = [claude_bin, "agents", "--json"]
-    run_cwd = cwd or Path(os.getcwd()).resolve()
+    run_cwd = cwd or Path.cwd()
     if cwd is not None:
         command.extend(["--cwd", str(cwd)])
-    result = run_cli(command, cwd=run_cwd)
+    try:
+        result = run_cli(
+            command,
+            cwd=run_cwd,
+            env=minimal_claude_environment(config_dir, claude_bin=claude_bin),
+        )
+    except subprocess.TimeoutExpired:
+        return ClaudeDiscoveryResult(
+            outcome="failure",
+            entries=[],
+            error="Claude discovery timed out after 10 seconds",
+        )
+    except OSError:
+        return ClaudeDiscoveryResult(
+            outcome="failure",
+            entries=[],
+            error="Claude discovery could not start or read its output",
+        )
+    except UnicodeError:
+        return ClaudeDiscoveryResult(
+            outcome="invalid_json",
+            entries=[],
+            error="Claude discovery returned undecodable output",
+        )
     if result.returncode != 0:
-        return []
+        return ClaudeDiscoveryResult(
+            outcome="failure",
+            entries=[],
+            error=f"Claude discovery failed with exit code {result.returncode}",
+        )
     try:
         entries = json.loads(result.stdout or "[]")
-    except json.JSONDecodeError:
-        return []
+    except (json.JSONDecodeError, RecursionError):
+        return ClaudeDiscoveryResult(
+            outcome="invalid_json",
+            entries=[],
+            error="Claude discovery returned invalid JSON",
+        )
     if not isinstance(entries, list):
-        return []
-    return [entry for entry in entries if isinstance(entry, dict)]
+        return ClaudeDiscoveryResult(
+            outcome="invalid_json",
+            entries=[],
+            error="Claude discovery JSON was not an array",
+        )
+    valid_entries = [entry for entry in entries if isinstance(entry, dict)]
+    if len(valid_entries) != len(entries):
+        return ClaudeDiscoveryResult(
+            outcome="invalid_json",
+            entries=[],
+            error="Claude discovery array contained invalid entries",
+        )
+    if not all(discovery_entry_is_valid(entry) for entry in valid_entries):
+        return ClaudeDiscoveryResult(
+            outcome="invalid_json",
+            entries=[],
+            error="Claude discovery array contained malformed session data",
+        )
+    return ClaudeDiscoveryResult(
+        outcome="success" if valid_entries else "empty",
+        entries=valid_entries,
+    )
 
 
 def select_last_state(config_dir: Path, *, cwd: Path | None = None) -> dict[str, Any] | None:
@@ -375,7 +425,7 @@ def select_last_state(config_dir: Path, *, cwd: Path | None = None) -> dict[str,
 
 
 def load_state(config_dir: Path, short_id: str) -> dict[str, Any] | None:
-    state = load_json_file(jobs_dir(config_dir) / short_id / "state.json")
+    state = read_job_state(config_dir, short_id).payload
     if state is not None:
         state["short_id"] = short_id
     return state
@@ -398,9 +448,48 @@ def load_json_file(path: Path) -> dict[str, Any] | None:
     try:
         with path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError, RecursionError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def read_job_state(config_dir: Path, short_id: str) -> JobStateResult:
+    path = jobs_dir(config_dir) / short_id / "state.json"
+    try:
+        if path.stat().st_size > MAX_JOB_STATE_BYTES:
+            return JobStateResult("invalid", None)
+        with path.open("r", encoding="utf-8") as handle:
+            raw = handle.read(MAX_JOB_STATE_BYTES + 1)
+    except FileNotFoundError:
+        return JobStateResult("missing", None)
+    except (OSError, UnicodeError):
+        return JobStateResult("invalid", None)
+    if len(raw) > MAX_JOB_STATE_BYTES:
+        return JobStateResult("invalid", None)
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, RecursionError):
+        return JobStateResult("invalid", None)
+    if not isinstance(payload, dict):
+        return JobStateResult("invalid", None)
+    for key in ("state", "updatedAt", "sessionId", "cwd"):
+        if key in payload and payload[key] is not None and not isinstance(payload[key], str):
+            return JobStateResult("invalid", None)
+    updated_at = payload.get("updatedAt")
+    if isinstance(updated_at, str) and safe_parse_timestamp(updated_at) is None:
+        return JobStateResult("invalid", None)
+    in_flight = payload.get("inFlight")
+    if in_flight is not None:
+        if not isinstance(in_flight, dict):
+            return JobStateResult("invalid", None)
+        tasks = in_flight.get("tasks", 0)
+        if isinstance(tasks, bool) or not isinstance(tasks, (int, float)):
+            return JobStateResult("invalid", None)
+    cwd = payload.get("cwd")
+    if isinstance(cwd, str) and "\x00" in cwd:
+        return JobStateResult("invalid", None)
+    payload["short_id"] = short_id
+    return JobStateResult("ok", payload)
 
 
 def short_session_id(value: str) -> str:
@@ -414,7 +503,7 @@ def short_session_id(value: str) -> str:
 def parse_version(raw: str) -> str:
     match = VERSION_RE.search(raw)
     if not match:
-        raise RuntimeError(f"could not parse Claude Code version from: {raw!r}")
+        raise RuntimeError("could not parse Claude Code version output")
     return ".".join(match.groups())
 
 
@@ -423,18 +512,47 @@ def version_tuple(raw: str) -> tuple[int, int, int]:
     return int(parts[0]), int(parts[1]), int(parts[2])
 
 
-def parse_auth_method(raw: str) -> str | None:
-    for line in raw.splitlines():
-        if line.lower().startswith("login method:"):
-            return line.split(":", 1)[1].strip()
-    return None
-
-
 def state_age_seconds(raw: str | None) -> float | None:
-    parsed = parse_timestamp(raw)
+    parsed = safe_parse_timestamp(raw)
     if parsed is None:
         return None
     return max(0.0, (datetime.now(UTC) - parsed.astimezone(UTC)).total_seconds())
+
+
+def safe_parse_timestamp(raw: str | None) -> datetime | None:
+    try:
+        return parse_timestamp(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def in_flight_tasks(state: dict[str, Any] | None) -> float:
+    in_flight = state.get("inFlight") if isinstance(state, dict) else None
+    if not isinstance(in_flight, dict):
+        return 0
+    tasks = in_flight.get("tasks", 0)
+    if isinstance(tasks, bool) or not isinstance(tasks, (int, float)):
+        return 0
+    return tasks
+
+
+def discovery_entry_is_valid(entry: dict[str, Any]) -> bool:
+    identity = (
+        value_as_str(entry, "shortSessionId")
+        or value_as_str(entry, "daemonShort")
+        or value_as_str(entry, "sessionId")
+    )
+    if identity is None:
+        return False
+    try:
+        short_session_id(identity)
+    except ValueError:
+        return False
+    for key in ("cwd", "status"):
+        value = entry.get(key)
+        if value is not None and not isinstance(value, str):
+            return False
+    return "\x00" not in (value_as_str(entry, "cwd") or "")
 
 
 def value_as_str(payload: dict[str, Any] | None, key: str) -> str | None:
@@ -444,18 +562,45 @@ def value_as_str(payload: dict[str, Any] | None, key: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def run_cli(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+def run_cli(
+    args: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         args,
         cwd=cwd,
+        env=env,
         capture_output=True,
         text=True,
         check=False,
+        timeout=10.0,
     )
 
 
-def command_error_text(result: subprocess.CompletedProcess[str]) -> str:
-    return (result.stderr or result.stdout or f"command failed with exit code {result.returncode}").strip()
+def configured_roots(values: list[str] | None = None) -> list[Path]:
+    raw_values = values or []
+    if not raw_values:
+        from_env = os.environ.get("AGENT_KEEPALIVE_CLAUDE_CONFIG_ROOTS", "")
+        raw_values = [value for value in from_env.split(os.pathsep) if value]
+    if not raw_values:
+        raw_values = [str(Path.home() / ".claude")]
+    return list(dict.fromkeys(Path(value).expanduser().resolve() for value in raw_values))
+
+
+def minimal_claude_environment(config_dir: Path, *, claude_bin: str) -> dict[str, str]:
+    resolved = Path(claude_bin)
+    inherited_path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+    path_value = inherited_path
+    if resolved.is_absolute() and str(resolved.parent) not in inherited_path.split(os.pathsep):
+        path_value = os.pathsep.join([str(resolved.parent), inherited_path])
+    return {
+        "HOME": str(Path.home()),
+        "PATH": path_value,
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "CLAUDE_CONFIG_DIR": str(config_dir.expanduser().resolve()),
+    }
 
 
 def snapshot_from_record(record: KeeperRecord) -> Snapshot:

@@ -2,31 +2,25 @@
 
 `agent-keepalive` keeps remote coding-agent sessions visible and attached on long-lived hosts.
 
-It currently supports:
+- **Codex:** attaches to the local app-server socket and stays subscribed to a thread until a configurable idle timeout.
+- **Claude Code:** runs one discovery supervisor that reports background jobs across one or more Claude config roots. Claude `--bg` execution is already independent; keepalive adds durable discovery, normalized blocked/terminal/disappeared status, and one buildserver-side `list`/`status` control plane across MacBook sleeps and SSH disconnects.
 
-- **Codex**: attaches to the local app-server control socket and stays subscribed to a thread until a configurable idle timeout.
-- **Claude Code**: monitors Claude Code background session state through Claude's own CLI and job files until the session becomes terminal or idle.
-
-The project is intentionally small. It does not patch Codex or Claude Code, does not rebuild either tool, does not require tmux, and does not copy conversation history into its own state.
+The project is intentionally small. It does not patch either provider, launch replacement sessions, require tmux, copy conversations, or ingest transcripts.
 
 ## Stability warning
 
-This tool relies on local implementation details of coding-agent CLIs:
-
-- Codex app-server websocket-over-unix-socket JSON-RPC methods.
-- Claude Code `claude agents --json` output and `~/.claude/jobs/<short-id>/state.json`.
-
-Those interfaces may change without notice. Treat this as a pragmatic host utility, not a stable vendor API client.
+This utility relies on local provider implementation details: Codex app-server JSON-RPC and Claude Code's `claude agents --json` plus `jobs/<short-id>/state.json`. Those interfaces may change without notice.
 
 ## Install
 
-Supported Python versions: `3.11` through `3.14`.
-
-From the repo root:
+Python 3.11 through 3.14 is supported. The documented host installation uses a dedicated venv:
 
 ```bash
 python3 -m venv ~/.local/share/agent-keepalive/venv
-~/.local/share/agent-keepalive/venv/bin/python -m pip install .
+python3 -m pip wheel . --no-deps --wheel-dir /tmp/agent-keepalive-wheel
+~/.local/share/agent-keepalive/venv/bin/python -m pip install --upgrade \
+  /tmp/agent-keepalive-wheel/agent_keepalive-*.whl
+~/.local/share/agent-keepalive/venv/bin/agent-keepalive --version
 ```
 
 For development:
@@ -35,224 +29,173 @@ For development:
 PYTHONPATH=src python3 -m agent_keepalive --help
 ```
 
-The primary CLI is:
-
-```bash
-agent-keepalive --help
-```
-
 ## Codex usage
 
-Start a background keeper for the most recent loaded or recent Codex thread:
+Start a background keeper for a recent or specific thread:
 
 ```bash
 agent-keepalive start codex --last --idle-timeout 1h
+agent-keepalive start codex --thread THREAD_ID --idle-timeout 90m
 ```
 
-Start a background keeper for a specific Codex thread:
+Override the app-server socket when needed:
 
 ```bash
-agent-keepalive start codex --thread 019e7526-3336-7c41-84ba-c566efdd199b --idle-timeout 90m
-```
-
-If the Codex control socket is not at the default path, pass it explicitly:
-
-```bash
-agent-keepalive start codex \
-  --thread 019e7526-3336-7c41-84ba-c566efdd199b \
+agent-keepalive start codex --thread THREAD_ID \
   --socket ~/.codex/app-server-control/desktop-ssh-websocket-v0.sock
 ```
 
-Codex keeps a thread alive by:
+Codex performs a version preflight, attaches with the normal initialize/resume handshake, tracks thread status/activity, and unsubscribes after the configured idle timeout. Temporary socket unavailability retries from 5 seconds to 5 minutes. For the daemon-managed socket only, a stale app-server is restarted; an unmanaged listener is stopped only when its exact socket ownership and Codex command line can be proved. Ambiguous recovery fails safely.
 
-1. Connects to the local Codex app-server control socket.
-2. Probes the target socket and runs a Codex app-server version preflight before it selects or resumes a thread.
-3. If the socket is serving an older app-server than the local Codex CLI / managed version, it tries a safe recovery first.
-4. Performs the normal `initialize` + `initialized` handshake.
-5. Calls `thread/resume` to attach as a subscriber.
-6. Tracks thread activity and status notifications.
-7. Calls `thread/unsubscribe` and exits after the configured idle timeout.
+## Claude usage
 
-Codex stale-server recovery works like this:
-
-1. Probes the exact target socket with the normal `initialize` handshake and extracts the running app-server version.
-2. Runs `codex app-server daemon version` and parses the JSON output.
-3. If the socket is current, keepalive attaches normally.
-4. If the socket is stale, keepalive first tries `codex app-server daemon restart`.
-5. If restart fails because an unmanaged `codex ... app-server --listen` process is holding the daemon socket, keepalive finds the process that owns that exact unix-socket inode, verifies that its command line matches a Codex app-server listener, stops only that process, and retries the daemon restart.
-6. If the socket still does not come back on the expected version, or if the process/socket ownership is ambiguous, keepalive exits with a clear error instead of attaching to stale state.
-
-Limitations:
-
-- Automatic recovery only applies to the daemon-managed Codex socket. If you point keepalive at a different custom socket and it is stale, keepalive fails loudly instead of trying to restart an unrelated server.
-- The unmanaged fallback assumes the stale listener is a `codex ... app-server --listen` process for the exact socket path. If that assumption cannot be proved from `/proc`, recovery is refused.
-
-If a systemd-managed Codex keeper starts before the app-server socket exists or while it refuses connections, the keeper remains running, records a clear diagnostic, and retries with exponential backoff from 5 seconds up to 5 minutes. Other startup failures still exit normally so systemd can report or restart them.
-
-## Claude Code usage
-
-Discover and supervise all live Claude Code background sessions:
+Run the single supervisor for the default root:
 
 ```bash
-agent-keepalive start claude --all --idle-timeout 1h
+agent-keepalive start claude --all
 ```
 
-Limit discovery to one repository:
+Observe both an interactive root and an isolated automation root:
 
 ```bash
-agent-keepalive start claude --all --cwd /path/to/repo --idle-timeout 1h
+agent-keepalive start claude --all \
+  --config-root ~/.claude \
+  --config-root ~/.config/spreadstation/claude-opus-runtime
 ```
 
-Monitor one specific Claude Code background session:
+An optional `--cwd /repo` filters each root's CLI discovery. A single-session monitor remains available for compatibility:
 
 ```bash
-agent-keepalive start claude --session 232e2060 --cwd /path/to/repo
+agent-keepalive start claude --session 232e2060 --cwd /repo \
+  --config-root ~/.claude
 ```
 
-Claude sessions can be identified by full UUID or the 8-character short id used under `~/.claude/jobs`.
+### How Claude supervision works
 
-Claude monitoring works by:
+`--all` is one long-running supervisor and has zero persistent per-session keeper children. Every second it reads local `jobs/<short-id>/state.json` files. Every 20 seconds it runs at most one `claude agents --json` command per configured root and caches the typed outcome. Discovery work therefore scales with roots and polling intervals, not session count.
 
-1. Runs preflight checks with `claude --version`, `claude auth status --text`, and `claude agents --json`.
-2. In `--all` mode, polls `claude agents --json` and starts one keeper per live Claude session it discovers.
-3. For each discovered session, reads `~/.claude/jobs/<short-id>/state.json` from the same discovery snapshot before starting a child keeper.
-4. Records status, detail, tempo, needs, suggested reply, transcript path, auth state, and cwd.
-5. Exits when a Claude job is terminal, or after the configured idle timeout for non-active states.
+Local state monitoring is authentication-independent. Normal monitoring never calls `claude auth status`. Claude subprocesses receive only `HOME`, `PATH`, `LANG`, and the current `CLAUDE_CONFIG_DIR`; credential variables are neither inherited nor stored. The dedicated SpreadStation token file is never opened by keepalive.
 
-In `--all` mode, a `blocked` job is not treated as an idle job. A blocked job is waiting for a Claude prerequisite or reply, so the discovery supervisor records it as suppressed and rechecks it on its normal poll interval instead of repeatedly starting a child that would immediately detach. The same applies while the job state file is unavailable. When the job state becomes eligible (normally `active`), the supervisor logs the transition and starts a keeper again. Terminal entries that remain in `claude agents --json` are recorded as removed from supervision.
+Session targets are root-qualified because the same short ID can exist in different roots:
 
-If a child keeper itself fails, the supervisor retains the error long enough to report it and retries with exponential backoff from 30 seconds to 5 minutes. Successful child starts clear that retry state. This is separate from suppression, so genuine provider or process failures remain visible.
+```text
+232e2060@<source-root-sha256>
+```
 
-Claude support is monitor-only. It discovers and adopts live Claude sessions, but it does not invent or relaunch missing ones.
+The suffix is the full SHA-256 digest of the canonical source-root path, so roots cannot collide through digest truncation. `status --target 232e2060` works when the short ID is unique; use the full root-qualified target copied from `list` when it is ambiguous.
 
-## Common commands
+Claude lifecycle states are deliberately distinct:
 
-List active keepers:
+- `state_missing`: discovery saw the session but its job file is absent;
+- `state_invalid`: the job file is unreadable, malformed, or structurally invalid;
+- `blocked`: the job is waiting for a prerequisite or response;
+- provider terminal states such as `done`, `failed`, or `cancelled`;
+- `disappeared`: a previously known session is absent from both local state and a successful discovery.
+
+Failed discovery and invalid discovery JSON are recorded on the supervisor and do not masquerade as successful empty discovery. They also do not make sessions disappear. Terminal and disappeared records remain visible for 60 seconds and are then removed. Unknown activity remains `-`; poll time is never presented as provider activity.
+
+The old `--all` idle timeout is accepted for CLI compatibility but does not terminate observations. Claude `--bg` owns execution lifetime; keepalive owns visibility.
+
+## List, status, and stop
 
 ```bash
 agent-keepalive list
-agent-keepalive list --provider codex
 agent-keepalive list --provider claude
-```
-
-Inspect a keeper:
-
-```bash
-agent-keepalive status --provider codex --target 019e7526-3336-7c41-84ba-c566efdd199b
-agent-keepalive status --provider claude --target 232e2060
-```
-
-Stop keepers:
-
-```bash
-agent-keepalive stop --provider codex --target 019e7526-3336-7c41-84ba-c566efdd199b
+agent-keepalive status --provider claude --target '232e2060@SOURCE_ROOT_SHA256'
+agent-keepalive stop --provider claude --target all
 agent-keepalive stop --all
 ```
 
-Example `list` output:
+Example Claude rows:
 
 ```text
-PROVIDER  TARGET                                 PID    STATUS      LOADED  LAST ACTIVITY   IDLE TIMEOUT  NAME
-codex     019e7526-3336-7c41-84ba-c566efdd199b   81234  active      yes     12s ago         1h            Activate on buildserver
-claude    all                                    81298  active      yes     8s ago          1h            Claude discovery
-claude    232e2060                               81341  blocked     yes     41s ago         1h            spreadstation
+PROVIDER  TARGET                                PID  STATUS       LOADED  LAST ACTIVITY  IDLE TIMEOUT  NAME
+claude    all                                 81298  active       yes     -              0s            Claude discovery supervisor
+claude    232e2060@SOURCE_ROOT_SHA256       81298  blocked      yes     41s ago        0s            232e2060-...
 ```
 
-Example `status` output:
+All Claude session observations share the supervisor PID. Stopping one root-qualified observation explicitly reports that it is stopping the shared `claude:all` supervisor.
+
+## State, privacy, and bounded logs
+
+Default paths:
 
 ```text
-Provider: claude
-Target: 232e2060
-Name: spreadstation
-PID: 81341
-Keeper status: attached
-Target status: blocked
-Loaded: yes
-Blocked: True
-Terminal: False
-Idle timeout: 1h
-Provider metadata:
-  claude_bin: claude
-  cwd: /srv/work/spreadstation
-  session_id: 232e2060-1111-2222-3333-444455556666
+~/.local/state/agent-keepalive/keepers/*.json
+~/.local/state/agent-keepalive/logs/*.log
 ```
 
-## State and privacy
+State includes operational IDs, paths, normalized status, timestamps, root identity, and discovery outcome. It excludes conversation text, free-form job detail, suggested replies, transcript paths/content, subprocess output, authentication data, and credential values.
 
-By default the tool writes:
-
-- State: `~/.local/state/agent-keepalive/keepers/*.json`
-- Logs: `~/.local/state/agent-keepalive/logs/*.log`
-
-State files contain operational metadata only: provider, target id, pid, display name, status, timestamps, idle timeout, log path, and provider-specific paths/status fields.
-
-No conversation history is copied into `agent-keepalive` state. Claude transcript paths may be recorded as paths, but transcript contents are not ingested by this tool.
+Transition logs always use bounded rotation: one 1 MiB active file plus three 1 MiB backups, approximately 4 MiB maximum per keeper. The Claude supervisor writes `supervisor-claude.log`, which is intentionally outside the legacy `claude*.log` cleanup pattern. Service/bootstrap messages still appear in journald. Only lifecycle transitions, discovery outcome changes, warnings, and failures are logged; unchanged polls are silent.
 
 ## systemd user service
 
-Install the template unit:
+Install the merged template and reload:
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp systemd/agent-keepalive@.service ~/.config/systemd/user/
+install -m 600 systemd/agent-keepalive@.service \
+  ~/.config/systemd/user/agent-keepalive@.service
 systemctl --user daemon-reload
-```
-
-Start and enable a Codex keeper:
-
-```bash
-systemctl --user start 'agent-keepalive@codex:019e7526-3336-7c41-84ba-c566efdd199b.service'
-systemctl --user enable 'agent-keepalive@codex:019e7526-3336-7c41-84ba-c566efdd199b.service'
-```
-
-Start and enable a Claude Code discovery supervisor:
-
-```bash
-systemctl --user start 'agent-keepalive@claude:all.service'
-systemctl --user enable 'agent-keepalive@claude:all.service'
-```
-
-For Claude Code, use a drop-in to scope discovery to one repository if desired:
-
-```ini
-[Service]
-Environment=AGENT_KEEPALIVE_CLAUDE_CWD=/path/to/repo
-Environment=AGENT_KEEPALIVE_IDLE_TIMEOUT=1h
-```
-
-For Codex socket overrides:
-
-```ini
-[Service]
-Environment=AGENT_KEEPALIVE_PROVIDER=codex
-Environment=AGENT_KEEPALIVE_CODEX_SOCKET=/home/you/.codex/app-server-control/desktop-ssh-websocket-v0.sock
-Environment=AGENT_KEEPALIVE_IDLE_TIMEOUT=1h
-```
-
-When a systemd-managed Codex keeper starts before the app-server is ready, it waits and reruns the same preflight before reattaching. This avoids a restart loop during boot while preserving automatic recovery and ensuring a local Codex CLI upgrade does not leave the keeper bound to an older app-server indefinitely.
-
-To allow user services to run after logout and start without an interactive login:
-
-```bash
 loginctl enable-linger "$USER"
 ```
 
-## Development
+For a multi-root Claude supervisor, create this drop-in:
 
-Run tests:
+```ini
+# ~/.config/systemd/user/agent-keepalive@claude:all.service.d/override.conf
+[Service]
+Environment=AGENT_KEEPALIVE_CLAUDE_BIN=claude
+Environment=AGENT_KEEPALIVE_CLAUDE_CONFIG_ROOTS=/home/you/.claude:/home/you/.config/spreadstation/claude-opus-runtime
+```
+
+Do not add Claude, Anthropic, SpreadStation, AWS, or Vertex credentials. The template explicitly unsets the known Claude/Anthropic/SpreadStation credential variables, and each discovery subprocess uses its own minimal allowlist.
+
+Enable and inspect the service:
+
+```bash
+systemctl --user enable --now 'agent-keepalive@claude:all.service'
+systemctl --user is-enabled 'agent-keepalive@claude:all.service'
+systemctl --user is-active 'agent-keepalive@claude:all.service'
+journalctl --user -u 'agent-keepalive@claude:all.service' --since=-10m
+```
+
+The unit invokes the venv CLI directly without a login shell, uses mode-0077-created files and bounded rotation, journals bootstrap output, stops the whole control group, and allows 15 seconds for graceful record cleanup.
+
+For Codex, enable an instance such as:
+
+```bash
+systemctl --user enable --now 'agent-keepalive@codex:THREAD_ID.service'
+```
+
+Use a drop-in to override `AGENT_KEEPALIVE_CODEX_SOCKET` when needed.
+
+## Troubleshooting
+
+- **`failure` discovery with local sessions still visible:** this is expected degradation. Check the user journal and run the same root with a credential-free environment; local job state remains authoritative.
+- **`invalid_json`:** the installed Claude CLI returned a non-array or malformed payload. Upgrade Claude Code or temporarily rely on local job files.
+- **`state_missing`:** discovery is ahead of job-file creation or cleanup. The next local poll updates it.
+- **`state_invalid`:** inspect the named root's job file permissions/shape without copying its content into an issue.
+- **`disappeared`:** both a successful discovery and the local root stopped seeing the session. The record remains for 60 seconds.
+- **Ambiguous short ID:** copy the root-qualified target from `agent-keepalive list`.
+- **Service restart loop:** keep the Claude service disabled, inspect `journalctl --user -u ...` and `~/.local/state/agent-keepalive/logs/supervisor-claude.log`, verify the installed CLI/version and root paths, then restart only this service.
+
+## Rollback
+
+To contain Claude supervision without affecting Claude `--bg` execution or Codex keepers:
+
+```bash
+systemctl --user disable --now 'agent-keepalive@claude:all.service'
+```
+
+Reinstall the previously retained wheel into `~/.local/share/agent-keepalive/venv`, restore its matching unit template/drop-in, run `systemctl --user daemon-reload`, and re-enable only after verifying the older behavior is acceptable. If no safe prior build is available, leave the Claude service disabled; background Claude jobs continue independently and can be inspected with Claude's own CLI. Never roll back by adding credentials to the supervisor environment.
+
+## Development and release checks
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'
-```
-
-Build a wheel:
-
-```bash
+python3 -m compileall -q src tests
 python3 -m pip wheel . --no-deps
 ```
 
-Other docs:
-
-- [ARCHITECTURE.md](ARCHITECTURE.md): provider model and process layout
-- [CONTRIBUTING.md](CONTRIBUTING.md): contribution expectations
-- [RELEASING.md](RELEASING.md): publish and release checklist
+See [ARCHITECTURE.md](ARCHITECTURE.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [RELEASING.md](RELEASING.md).

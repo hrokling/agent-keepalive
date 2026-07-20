@@ -9,11 +9,13 @@ import subprocess
 import sys
 import time
 
+from . import __version__
 from .claude_supervisor import ClaudeDiscoverySupervisor
 from .paths import AppPaths
 from .paths import default_state_root
 from .providers import get_provider
 from .providers.claude import short_session_id
+from .providers.claude import configured_roots
 from .providers.codex import discover_socket_path
 from .providers.base import RunConfig
 from .runner import Keeper
@@ -37,6 +39,7 @@ def build_parser(prog: str = "agent-keepalive") -> argparse.ArgumentParser:
         prog=prog,
         description="Keep remote coding-agent sessions observable and alive on long-lived hosts.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     start = subparsers.add_parser("start", help="Start a background keepalive process")
@@ -69,6 +72,10 @@ def build_parser(prog: str = "agent-keepalive") -> argparse.ArgumentParser:
     status.add_argument("--target", help="Provider target id to inspect")
     status.add_argument("--state-root", default=str(default_state_root()), help=argparse.SUPPRESS)
     status.set_defaults(func=command_status)
+
+    service = subparsers.add_parser("service", help=argparse.SUPPRESS)
+    service.add_argument("instance", help=argparse.SUPPRESS)
+    service.set_defaults(func=command_service)
 
     return parser
 
@@ -106,6 +113,11 @@ def add_claude_start(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--all", action="store_true", help="Discover and supervise all live Claude sessions")
     parser.add_argument("--cwd", help="Claude project working directory")
     parser.add_argument("--claude-bin", default="claude", help="Claude Code executable")
+    parser.add_argument(
+        "--config-root",
+        action="append",
+        help="Claude state/config root (repeat for --all; defaults to ~/.claude)",
+    )
     add_common_start(parser)
     parser.set_defaults(func=command_start, provider="claude")
 
@@ -116,6 +128,11 @@ def add_claude_run(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--all", action="store_true", help="Discover and supervise all live Claude sessions")
     parser.add_argument("--cwd", help="Claude project working directory")
     parser.add_argument("--claude-bin", default="claude", help="Claude Code executable")
+    parser.add_argument(
+        "--config-root",
+        action="append",
+        help="Claude state/config root (repeat for --all; defaults to ~/.claude)",
+    )
     add_common_run(parser)
     parser.set_defaults(func=command_run, provider="claude", target_attr="session")
 
@@ -141,25 +158,24 @@ def command_start(args: argparse.Namespace) -> int:
     if existing and not process_is_alive(existing.pid):
         store.remove(target.provider, target.target_id)
 
-    child_env = child_environment()
-    log_path = store.paths.keeper_log_path(target.provider, target.target_id)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    child_env = child_environment(target.provider)
     command = run_command_for_target(args, target.target_id, state_root, target.selected_via, target.metadata)
-    with log_path.open("ab") as log_handle:
-        process = subprocess.Popen(  # noqa: S603
-            command,
-            cwd=os.getcwd(),
-            env=child_env,
-            start_new_session=True,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            close_fds=True,
-        )
+    process = subprocess.Popen(  # noqa: S603
+        command,
+        cwd=os.getcwd(),
+        env=child_env,
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
 
     deadline = time.monotonic() + 5.0
+    diagnostic_log_path: Path | None = None
     while time.monotonic() < deadline:
         record = store.load(target.provider, target.target_id)
         if record and record.pid == process.pid:
+            diagnostic_log_path = Path(record.log_path)
             if record.keeper_status == "attached":
                 print(f"started keepalive for {target.provider} target {target.target_id}")
                 if target.display_name:
@@ -173,7 +189,7 @@ def command_start(args: argparse.Namespace) -> int:
             break
         time.sleep(0.1)
 
-    tail = tail_file(log_path)
+    tail = tail_file(diagnostic_log_path) if diagnostic_log_path is not None else ""
     print("keepalive process exited before it became ready", file=sys.stderr)
     if tail:
         print(tail, file=sys.stderr)
@@ -188,6 +204,7 @@ def command_run(args: argparse.Namespace) -> int:
         if getattr(args, "all", False):
             return ClaudeDiscoverySupervisor(
                 claude_bin=args.claude_bin,
+                config_roots=configured_roots(args.config_root),
                 cwd=Path(args.cwd).expanduser().resolve() if args.cwd else None,
                 idle_timeout=args.idle_timeout,
                 state_root=Path(args.state_root),
@@ -196,6 +213,7 @@ def command_run(args: argparse.Namespace) -> int:
         metadata = {
             "claude_bin": args.claude_bin,
             "cwd": str(Path(args.cwd or os.getcwd()).resolve()),
+            "config_dir": str(configured_roots(args.config_root)[0]),
         }
     config = RunConfig(
         provider=args.provider,
@@ -208,6 +226,43 @@ def command_run(args: argparse.Namespace) -> int:
     return Keeper(config).run()
 
 
+def command_service(args: argparse.Namespace) -> int:
+    instance = args.instance
+    if ":" in instance:
+        provider, target = instance.split(":", 1)
+    else:
+        provider = os.environ.get("AGENT_KEEPALIVE_PROVIDER", "codex")
+        target = instance
+    idle_timeout = os.environ.get("AGENT_KEEPALIVE_IDLE_TIMEOUT", "1h")
+    if provider == "claude":
+        namespace = argparse.Namespace(
+            provider="claude",
+            all=target == "all",
+            session=None if target == "all" else target,
+            target_attr="session",
+            claude_bin=os.environ.get("AGENT_KEEPALIVE_CLAUDE_BIN", "claude"),
+            cwd=os.environ.get("AGENT_KEEPALIVE_CLAUDE_CWD") or None,
+            config_root=None,
+            idle_timeout=idle_timeout,
+            state_root=str(default_state_root()),
+            selected_via="systemd",
+        )
+    elif provider == "codex":
+        namespace = argparse.Namespace(
+            provider="codex",
+            thread=target,
+            target_attr="thread",
+            socket=os.environ.get("AGENT_KEEPALIVE_CODEX_SOCKET"),
+            idle_timeout=idle_timeout,
+            state_root=str(default_state_root()),
+            selected_via="systemd",
+        )
+    else:
+        print(f"unsupported service provider: {provider}", file=sys.stderr)
+        return 2
+    return command_run(namespace)
+
+
 def command_stop(args: argparse.Namespace) -> int:
     store = StateStore(AppPaths(Path(args.state_root)))
     remove_stale_records(store)
@@ -217,6 +272,19 @@ def command_stop(args: argparse.Namespace) -> int:
     else:
         if args.provider:
             record = store.load(args.provider, args.target)
+            if record is None:
+                aliases = [
+                    item
+                    for item in store.list(provider=args.provider)
+                    if item.provider_metadata.get("short_session_id") == args.target
+                ]
+                if len(aliases) > 1:
+                    print(
+                        f"Claude target {args.target} is ambiguous across config roots; use a root-qualified target",
+                        file=sys.stderr,
+                    )
+                    return 2
+                record = aliases[0] if aliases else None
             targets = [record] if record is not None else []
         else:
             targets = [record for record in store.list() if record.target_id == args.target]
@@ -225,14 +293,27 @@ def command_stop(args: argparse.Namespace) -> int:
         print("no matching keepalive processes found", file=sys.stderr)
         return 1
 
+    if len(targets) == 1 and targets[0] is not None:
+        selected = targets[0]
+        if selected.provider_metadata.get("managed_by_supervisor"):
+            supervisor = store.load("claude", "all")
+            if supervisor is not None:
+                print(
+                    f"Claude target {selected.target_id} is observed by the shared supervisor; stopping claude:all"
+                )
+                targets = [supervisor]
+
+    signaled_pids: set[int] = set()
     for record in targets:
         assert record is not None
         if not process_is_alive(record.pid):
             store.remove(record.provider, record.target_id)
             print(f"removed stale state for {record.provider} target {record.target_id}")
             continue
-        os.kill(record.pid, signal.SIGTERM)
-        print(f"sent SIGTERM to pid {record.pid} for {record.provider} target {record.target_id}")
+        if record.pid not in signaled_pids:
+            os.kill(record.pid, signal.SIGTERM)
+            signaled_pids.add(record.pid)
+            print(f"sent SIGTERM to pid {record.pid} for {record.provider} target {record.target_id}")
 
     deadline = time.monotonic() + float(args.wait)
     remaining = {
@@ -307,7 +388,19 @@ def command_status(args: argparse.Namespace) -> int:
 
     records = store.list(provider=args.provider)
     if args.target:
-        records = [record for record in records if record.target_id == args.target]
+        exact = [record for record in records if record.target_id == args.target]
+        aliases = [
+            record
+            for record in records
+            if record.provider_metadata.get("short_session_id") == args.target
+        ]
+        if not exact and len(aliases) > 1:
+            print(
+                f"Claude target {args.target} is ambiguous across config roots; use a root-qualified target",
+                file=sys.stderr,
+            )
+            return 2
+        records = exact or aliases
     if not records:
         print("no matching active keepalive processes")
         return 0
@@ -389,6 +482,12 @@ def run_command_for_target(
         if metadata.get("cwd"):
             command.extend(["--cwd", str(metadata["cwd"])])
         command.extend(["--claude-bin", str(metadata.get("claude_bin", "claude"))])
+        roots = metadata.get("config_roots")
+        if isinstance(roots, list):
+            for root in roots:
+                command.extend(["--config-root", str(root)])
+        elif metadata.get("config_dir"):
+            command.extend(["--config-root", str(metadata["config_dir"])])
     command.extend(
         [
             "--idle-timeout",
@@ -402,11 +501,20 @@ def run_command_for_target(
     return command
 
 
-def child_environment() -> dict[str, str]:
+def child_environment(provider: str = "codex") -> dict[str, str]:
     python_path_entries = [str(Path(__file__).resolve().parents[1])]
-    if os.environ.get("PYTHONPATH"):
+    if provider != "claude" and os.environ.get("PYTHONPATH"):
         python_path_entries.append(os.environ["PYTHONPATH"])
-    child_env = os.environ.copy()
+    if provider == "claude":
+        child_env = {
+            "HOME": str(Path.home()),
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+        }
+        if os.environ.get("AGENT_KEEPALIVE_LOG_DEST"):
+            child_env["AGENT_KEEPALIVE_LOG_DEST"] = os.environ["AGENT_KEEPALIVE_LOG_DEST"]
+    else:
+        child_env = os.environ.copy()
     child_env["PYTHONPATH"] = os.pathsep.join(python_path_entries)
     return child_env
 
