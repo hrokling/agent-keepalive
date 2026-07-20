@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import argparse
+from contextlib import redirect_stderr
+import io
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,8 +13,14 @@ import subprocess
 from unittest import mock
 
 from agent_keepalive.cli import build_parser
+from agent_keepalive.cli import command_start
 from agent_keepalive.providers import get_provider
 from agent_keepalive.providers.claude import observe_claude
+from agent_keepalive.providers.claude import discover_claude
+from agent_keepalive.providers.claude import ClaudeProvider
+from agent_keepalive.providers.claude import minimal_claude_environment
+from agent_keepalive.providers.claude import preflight_claude
+from agent_keepalive.providers.claude import read_job_state
 from agent_keepalive.providers.claude import select_last_state
 from agent_keepalive.providers.claude import short_session_id
 from agent_keepalive.providers.claude import status_from_payload
@@ -21,6 +32,7 @@ from agent_keepalive.providers.codex_recovery import ensure_current_codex_app_se
 from agent_keepalive.providers.codex_recovery import parse_daemon_version
 from agent_keepalive.providers.codex_recovery import probe_socket_app_server_version
 from agent_keepalive.providers.base import RunConfig
+from agent_keepalive.providers.base import ResolvedTarget
 from agent_keepalive.state import KeeperRecord
 from agent_keepalive.state import StateStore
 from agent_keepalive.paths import AppPaths
@@ -50,10 +62,13 @@ class CliParserTests(unittest.TestCase):
         self.assertEqual(args.session, "12345678")
 
     def test_new_claude_all_shape(self) -> None:
-        args = build_parser().parse_args(["run", "claude", "--all"])
+        args = build_parser().parse_args(
+            ["run", "claude", "--all", "--config-root", "/one", "--config-root", "/two"]
+        )
         self.assertEqual(args.command, "run")
         self.assertEqual(args.provider, "claude")
         self.assertTrue(args.all)
+        self.assertEqual(args.config_root, ["/one", "/two"])
 
 
 class StateTests(unittest.TestCase):
@@ -322,16 +337,208 @@ class ClaudeProviderTests(unittest.TestCase):
                 )
             self.assertEqual(snapshot.status, "blocked")
             self.assertTrue(snapshot.blocked)
-            self.assertEqual(snapshot.metadata["suggested_reply"], "continue")
+            self.assertNotIn("suggested_reply", snapshot.metadata)
+
+    def test_unknown_activity_is_not_replaced_with_current_time(self) -> None:
+        from agent_keepalive.providers.claude import ClaudePreflight
+
+        snapshot = observe_claude_entry_for_test(
+            ClaudePreflight("claude", "2.1.215", None, None, Path("/tmp/root")),
+            state={"state": "active"},
+        )
+        self.assertIsNone(snapshot.last_activity_at)
+
+    def test_job_state_outcomes_distinguish_missing_invalid_and_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.assertEqual(read_job_state(root, "11111111").outcome, "missing")
+            path = root / "jobs" / "11111111" / "state.json"
+            path.parent.mkdir(parents=True)
+            path.write_text("[]", encoding="utf-8")
+            self.assertEqual(read_job_state(root, "11111111").outcome, "invalid")
+            path.write_text('{"state":"blocked"}', encoding="utf-8")
+            self.assertEqual(read_job_state(root, "11111111").outcome, "ok")
+
+    def test_malformed_consumed_job_fields_are_invalid_and_never_raise(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "jobs" / "11111111" / "state.json"
+            path.parent.mkdir(parents=True)
+            for payload in (
+                {"state": "idle", "updatedAt": "not-a-timestamp"},
+                {"state": "idle", "inFlight": {"tasks": "not-a-number"}},
+                {"state": "idle", "inFlight": []},
+                {"state": "active", "cwd": "bad\x00path"},
+            ):
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                self.assertEqual(read_job_state(root, "11111111").outcome, "invalid")
+                self.assertIsInstance(status_from_payload(payload, None), str)
+            path.write_bytes(b"\xff")
+            self.assertEqual(read_job_state(root, "11111111").outcome, "invalid")
+
+    def test_fake_claude_receives_minimal_credential_free_environment(self) -> None:
+        credential_names = [
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "SPREADSTATION_CLAUDE_OAUTH_TOKEN_FILE",
+            "AWS_SECRET_ACCESS_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        ]
+        marker = "NEVER_PERSIST_THIS_CREDENTIAL"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fake = root / "fake-claude"
+            capture = root / "capture.json"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "names = " + repr(credential_names) + "\n"
+                "if '--version' in sys.argv:\n"
+                "    print('2.1.215 (Claude Code)')\n"
+                "else:\n"
+                "    with open(" + repr(str(capture)) + ", 'w') as f:\n"
+                "        json.dump({'present': [n for n in names if n in os.environ], 'argv': sys.argv[1:]}, f)\n"
+                "    print('[]')\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o700)
+            polluted = {name: marker for name in credential_names}
+            with mock.patch.dict(os.environ, polluted, clear=False):
+                preflight = preflight_claude(str(fake), config_dir=root)
+                result = discover_claude(preflight.claude_bin, config_dir=root, cwd=None)
+            self.assertEqual(result.outcome, "empty")
+            captured = json.loads(capture.read_text(encoding="utf-8"))
+            self.assertEqual(captured["present"], [])
+            self.assertNotIn("auth", captured["argv"])
+            artifacts = "".join(
+                path.read_text(encoding="utf-8", errors="replace")
+                for path in root.rglob("*")
+                if path.is_file()
+            )
+            self.assertNotIn(marker, artifacts)
+
+    def test_discovery_failure_and_invalid_json_do_not_expose_output(self) -> None:
+        secret = "SECRET_OUTPUT_MARKER"
+        failure = subprocess.CompletedProcess(["claude"], 9, secret, secret)
+        invalid = subprocess.CompletedProcess(["claude"], 0, secret, "")
+        with mock.patch("agent_keepalive.providers.claude.run_cli", return_value=failure):
+            result = discover_claude("claude", config_dir=Path("/tmp/root"), cwd=None)
+        self.assertEqual(result.outcome, "failure")
+        self.assertNotIn(secret, result.error)
+        with mock.patch("agent_keepalive.providers.claude.run_cli", return_value=invalid):
+            result = discover_claude("claude", config_dir=Path("/tmp/root"), cwd=None)
+        self.assertEqual(result.outcome, "invalid_json")
+        self.assertNotIn(secret, result.error)
+
+    def test_discovery_spawn_and_decode_errors_are_typed_failures(self) -> None:
+        failures = (
+            (OSError("SECRET_OS_ERROR"), "failure"),
+            (UnicodeDecodeError("utf-8", b"x", 0, 1, "SECRET_DECODE_ERROR"), "invalid_json"),
+        )
+        for error, expected in failures:
+            with mock.patch("agent_keepalive.providers.claude.run_cli", side_effect=error):
+                result = discover_claude("claude", config_dir=Path("/tmp/root"), cwd=None)
+            self.assertEqual(result.outcome, expected)
+            self.assertNotIn("SECRET", result.error)
+
+    def test_malformed_discovery_cwd_is_invalid_json(self) -> None:
+        malformed = subprocess.CompletedProcess(
+            ["claude"],
+            0,
+            '[{"sessionId":"12345678-1234-1234-1234-123456789abc","cwd":"bad\\u0000path"}]',
+            "",
+        )
+        with mock.patch("agent_keepalive.providers.claude.run_cli", return_value=malformed):
+            result = discover_claude("claude", config_dir=Path("/tmp/root"), cwd=None)
+        self.assertEqual(result.outcome, "invalid_json")
+        self.assertEqual(result.entries, [])
+
+    def test_minimal_environment_is_an_allowlist(self) -> None:
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "marker"}, clear=False):
+            environment = minimal_claude_environment(Path("/tmp/root"), claude_bin="claude")
+        self.assertEqual(set(environment), {"HOME", "PATH", "LANG", "CLAUDE_CONFIG_DIR"})
+        self.assertNotIn("ANTHROPIC_API_KEY", environment)
+
+    def test_supervisor_records_are_rendered_without_claude_subprocesses(self) -> None:
+        record = KeeperRecord.new(
+            provider="claude",
+            target_id="12345678@abcdef12",
+            pid=123,
+            display_name="12345678",
+            idle_timeout_seconds=0,
+            log_path=Path("/tmp/log"),
+            selected_via="all",
+            provider_metadata={"managed_by_supervisor": True, "source_root": "/tmp/root"},
+        )
+        record.target_status = "blocked"
+        record.blocked = True
+        with mock.patch("agent_keepalive.providers.claude.preflight_claude") as preflight:
+            view = ClaudeProvider().live_view([record])
+        preflight.assert_not_called()
+        self.assertEqual(view[record.target_id].status, "blocked")
 
 
 class SystemdTemplateTests(unittest.TestCase):
     def test_template_uses_agent_keepalive(self) -> None:
         content = Path("systemd/agent-keepalive@.service").read_text(encoding="utf-8")
-        self.assertIn("agent-keepalive run", content)
+        self.assertIn("agent-keepalive service %i", content)
         self.assertIn("Description=Agent keepalive for %i", content)
-        self.assertIn("claude:*)", content)
-        self.assertIn('target="%i"', content)
+        self.assertIn("AGENT_KEEPALIVE_CLAUDE_CONFIG_ROOTS", content)
+        self.assertIn("UnsetEnvironment=CLAUDE_CODE_OAUTH_TOKEN", content)
+        self.assertIn("SPREADSTATION_CLAUDE_OAUTH_TOKEN_FILE", content)
+        self.assertIn("AWS_SECRET_ACCESS_KEY", content)
+        self.assertIn("AGENT_KEEPALIVE_LOG_DEST=file", content)
+        self.assertIn("KillMode=control-group", content)
+        self.assertNotIn("/bin/sh -l", content)
+
+
+class StartCommandTests(unittest.TestCase):
+    def test_failed_claude_all_start_never_tails_legacy_log(self) -> None:
+        marker = "LEGACY_SECRET_MARKER"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_root = Path(temp_dir)
+            legacy = state_root / "logs" / "claude-all.log"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text(marker, encoding="utf-8")
+            args = argparse.Namespace(
+                provider="claude",
+                state_root=str(state_root),
+                idle_timeout="1h",
+            )
+            provider = mock.Mock()
+            provider.resolve.return_value = ResolvedTarget(
+                provider="claude",
+                target_id="all",
+                display_name="Claude discovery supervisor",
+                selected_via="all",
+                metadata={
+                    "claude_bin": "claude",
+                    "cwd": "",
+                    "config_roots": ["/tmp/root"],
+                },
+            )
+            process = mock.Mock(pid=999999)
+            process.poll.return_value = 1
+            stderr = io.StringIO()
+            with mock.patch("agent_keepalive.cli.get_provider", return_value=provider), mock.patch(
+                "agent_keepalive.cli.subprocess.Popen", return_value=process
+            ), redirect_stderr(stderr):
+                result = command_start(args)
+            self.assertEqual(result, 1)
+            self.assertNotIn(marker, stderr.getvalue())
+
+
+def observe_claude_entry_for_test(preflight, *, state):
+    from agent_keepalive.providers.claude import snapshot_from_claude_sources
+
+    return snapshot_from_claude_sources(
+        preflight=preflight,
+        short_id="12345678",
+        cwd=Path("/repo"),
+        state=state,
+        live_entry=None,
+    )
 
 
 class RunConfigTests(unittest.TestCase):

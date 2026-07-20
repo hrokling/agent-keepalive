@@ -9,9 +9,19 @@ Environment=AGENT_KEEPALIVE_IDLE_TIMEOUT=1h
 Environment=AGENT_KEEPALIVE_CODEX_SOCKET=%h/.codex/app-server-control/app-server-control.sock
 Environment=AGENT_KEEPALIVE_CLAUDE_BIN=claude
 Environment=AGENT_KEEPALIVE_CLAUDE_CWD=
-ExecStart=/bin/sh -lc 'target="%i"; provider="$${AGENT_KEEPALIVE_PROVIDER}"; case "$$target" in codex:*) provider=codex; target="$${target#codex:}" ;; claude:*) provider=claude; target="$${target#claude:}" ;; esac; if [ "$$provider" = "claude" ]; then if [ "$$target" = "all" ]; then if [ -n "$${AGENT_KEEPALIVE_CLAUDE_CWD}" ]; then exec agent-keepalive run claude --all --cwd "$${AGENT_KEEPALIVE_CLAUDE_CWD}" --claude-bin "$${AGENT_KEEPALIVE_CLAUDE_BIN}" --idle-timeout "$${AGENT_KEEPALIVE_IDLE_TIMEOUT}"; else exec agent-keepalive run claude --all --claude-bin "$${AGENT_KEEPALIVE_CLAUDE_BIN}" --idle-timeout "$${AGENT_KEEPALIVE_IDLE_TIMEOUT}"; fi; else if [ -n "$${AGENT_KEEPALIVE_CLAUDE_CWD}" ]; then exec agent-keepalive run claude --session "$$target" --cwd "$${AGENT_KEEPALIVE_CLAUDE_CWD}" --claude-bin "$${AGENT_KEEPALIVE_CLAUDE_BIN}" --idle-timeout "$${AGENT_KEEPALIVE_IDLE_TIMEOUT}"; else exec agent-keepalive run claude --session "$$target" --claude-bin "$${AGENT_KEEPALIVE_CLAUDE_BIN}" --idle-timeout "$${AGENT_KEEPALIVE_IDLE_TIMEOUT}"; fi; fi; else exec agent-keepalive run codex --thread "$$target" --socket "$${AGENT_KEEPALIVE_CODEX_SOCKET}" --idle-timeout "$${AGENT_KEEPALIVE_IDLE_TIMEOUT}"; fi'
+Environment=AGENT_KEEPALIVE_CLAUDE_CONFIG_ROOTS=%h/.claude
+Environment=AGENT_KEEPALIVE_LOG_DEST=file
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+UnsetEnvironment=CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN_FILE ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BEARER_TOKEN SPREADSTATION_CLAUDE_OAUTH_TOKEN_FILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN GOOGLE_APPLICATION_CREDENTIALS
+ExecStart=%h/.local/share/agent-keepalive/venv/bin/agent-keepalive service %i
 Restart=on-failure
 RestartSec=5
+KillMode=control-group
+TimeoutStopSec=15
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-keepalive-%i
 
 [Install]
 WantedBy=default.target

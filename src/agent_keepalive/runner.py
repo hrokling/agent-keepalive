@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import os
 from pathlib import Path
 import signal
@@ -8,6 +7,7 @@ import sys
 import time
 
 from .paths import AppPaths
+from .logging_utils import configure_logger
 from .providers import get_provider
 from .providers.base import RunConfig
 from .providers.base import Snapshot
@@ -24,23 +24,6 @@ CODEX_APP_SERVER_RETRY_INITIAL_DELAY = 5.0
 CODEX_APP_SERVER_RETRY_MAX_DELAY = 300.0
 
 
-def configure_logger(log_path: Path) -> logging.Logger:
-    logger = logging.getLogger(f"agent_keepalive.{log_path.stem}")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    logger.handlers.clear()
-
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.FileHandler(log_path, encoding="utf-8")
-    formatter = logging.Formatter(
-        fmt="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
-    )
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    return logger
-
-
 class Keeper:
     def __init__(self, config: RunConfig) -> None:
         self.config = config
@@ -49,7 +32,7 @@ class Keeper:
         self.paths.ensure()
         self.store = StateStore(self.paths)
         self.log_path = self.paths.keeper_log_path(config.provider, config.target_id)
-        self.logger = configure_logger(self.log_path)
+        self.logger = configure_logger(f"agent_keepalive.{self.log_path.stem}", self.log_path)
         self.session = self.provider.session(config)
         self.stop_requested = False
         self.stop_reason = "unknown"
@@ -134,10 +117,26 @@ class Keeper:
             return 0
         except BaseException as exc:  # noqa: BLE001
             self.record.keeper_status = "error"
-            self.record.last_error = str(exc)
+            if self.config.provider == "claude":
+                self.record.last_error = type(exc).__name__
+            else:
+                self.record.last_error = str(exc)
             self._persist_state()
-            self.logger.exception("keeper failed for %s target %s", self.config.provider, self.config.target_id)
-            print(f"agent-keepalive error: {exc}", file=sys.stderr)
+            if self.config.provider == "claude":
+                self.logger.error(
+                    "keeper failed for %s target %s error_type=%s",
+                    self.config.provider,
+                    self.config.target_id,
+                    type(exc).__name__,
+                )
+                print(f"agent-keepalive error: {type(exc).__name__}", file=sys.stderr)
+            else:
+                self.logger.exception(
+                    "keeper failed for %s target %s",
+                    self.config.provider,
+                    self.config.target_id,
+                )
+                print(f"agent-keepalive error: {exc}", file=sys.stderr)
             return 1
         finally:
             try:

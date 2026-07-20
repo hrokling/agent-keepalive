@@ -43,6 +43,8 @@ This project is still small enough that a short manual checklist is more useful 
 5. Tag the release.
 6. Push the branch and tag.
 
+Use an annotated `v<version>` tag, then verify the tag resolves to the merged `main` release commit and that the tag-triggered GitHub Actions run passes.
+
 ## Notes
 
 - Commit authorship should use the real human or bot identity that owns the work.

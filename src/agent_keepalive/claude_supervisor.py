@@ -1,338 +1,427 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+import hashlib
 import logging
 import os
 from pathlib import Path
 import signal
-import subprocess
 import sys
 import time
+from typing import Any
 
+from .logging_utils import configure_logger
 from .paths import AppPaths
-from .providers.base import Snapshot
-from .providers.base import should_detach
-from .providers.claude import ClaudePreflight
-from .providers.claude import list_live_entries
-from .providers.claude import observe_claude_entry
+from .providers.claude import ClaudeDiscoveryResult
+from .providers.claude import JobStateResult
+from .providers.claude import discover_claude
 from .providers.claude import preflight_claude
+from .providers.claude import read_job_state
+from .providers.claude import snapshot_from_claude_sources
+from .providers.claude import short_session_id
+from .providers.claude import value_as_str
 from .state import KeeperRecord
 from .state import StateStore
-from .state import process_is_alive
-from .timeparse import parse_duration
+from .timeparse import isoformat_or_none
 from .timeparse import utc_now
 
 
-POLL_INTERVAL = 15.0
-CHILD_FAILURE_RETRY_INITIAL_DELAY = 30.0
-CHILD_FAILURE_RETRY_MAX_DELAY = 300.0
+DISCOVERY_INTERVAL = 20.0
+LOCAL_STATE_INTERVAL = 1.0
+DISAPPEARANCE_GRACE_SECONDS = 60.0
+TERMINAL_GRACE_SECONDS = 60.0
 
 
-def configure_logger(log_path: Path) -> logging.Logger:
-    logger = logging.getLogger(f"agent_keepalive.{log_path.stem}")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    for existing_handler in logger.handlers:
-        logger.removeHandler(existing_handler)
-        existing_handler.close()
+@dataclass
+class SessionLifecycle:
+    target_id: str
+    config_root: Path
+    short_id: str
+    missing_since: float | None = None
+    terminal_since: float | None = None
+    signature: tuple[object, ...] | None = None
 
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.FileHandler(log_path, encoding="utf-8")
-    formatter = logging.Formatter(
-        fmt="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
-    )
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    return logger
+
+def root_fingerprint(config_root: Path) -> str:
+    return hashlib.sha256(str(config_root.resolve()).encode("utf-8")).hexdigest()
+
+
+def session_target_id(config_root: Path, short_id: str) -> str:
+    return f"{short_id}@{root_fingerprint(config_root)}"
 
 
 class ClaudeDiscoverySupervisor:
+    """One process that discovers and records sessions across Claude roots."""
+
     def __init__(
         self,
         *,
         claude_bin: str,
+        config_roots: list[Path],
         cwd: Path | None,
         idle_timeout: str,
         state_root: Path,
+        discovery_interval: float = DISCOVERY_INTERVAL,
+        local_state_interval: float = LOCAL_STATE_INTERVAL,
+        disappearance_grace: float = DISAPPEARANCE_GRACE_SECONDS,
+        terminal_grace: float = TERMINAL_GRACE_SECONDS,
     ) -> None:
+        del idle_timeout  # Session execution is independent; records do not time it out.
+        if not config_roots:
+            raise ValueError("at least one Claude config root is required")
         self.claude_bin = claude_bin
+        self.config_roots = list(dict.fromkeys(root.expanduser().resolve() for root in config_roots))
         self.cwd = cwd
-        self.idle_timeout = idle_timeout
-        self.idle_timeout_seconds = int(parse_duration(idle_timeout).total_seconds())
+        self.discovery_interval = discovery_interval
+        self.local_state_interval = local_state_interval
+        self.disappearance_grace = disappearance_grace
+        self.terminal_grace = terminal_grace
         self.paths = AppPaths(state_root)
         self.paths.ensure()
         self.store = StateStore(self.paths)
-        self.log_path = self.paths.keeper_log_path("claude", "all")
-        self.logger = configure_logger(self.log_path)
+        for stale in self.store.list(provider="claude"):
+            if stale.provider_metadata.get("managed_by_supervisor"):
+                self.store.remove(stale.provider, stale.target_id)
+        self.log_path = self.paths.keeper_log_path("supervisor", "claude")
+        self.logger = configure_logger("agent_keepalive.claude_all", self.log_path)
         self.stop_requested = False
         self.record = KeeperRecord.new(
             provider="claude",
             target_id="all",
             pid=os.getpid(),
-            display_name="all Claude sessions",
+            display_name="Claude discovery supervisor",
             idle_timeout_seconds=0,
             log_path=self.log_path,
             selected_via="all",
             provider_metadata={
                 "mode": "all",
                 "claude_bin": claude_bin,
-                "cwd": str(cwd) if cwd is not None else "",
-                "suppressed_sessions": {},
-                "child_failure_retries": {},
+                "config_roots": [str(root) for root in self.config_roots],
+                "discovery_interval_seconds": discovery_interval,
+                "local_state_interval_seconds": local_state_interval,
+                "disappearance_grace_seconds": disappearance_grace,
+                "terminal_grace_seconds": terminal_grace,
+                "persistent_session_children": 0,
+                "discovery": {},
             },
         )
-        self.record.keeper_status = "attached"
         self.record.target_status = "idle"
         self.record.loaded = True
-        self._suppressed_sessions: dict[str, dict[str, str]] = {}
-        self._child_failure_counts: dict[str, int] = {}
-        self._child_retry_not_before: dict[str, float] = {}
+        self._last_discovery_at: dict[Path, float] = {}
+        self._discovery_entries: dict[Path, dict[str, dict[str, Any]]] = {
+            root: {} for root in self.config_roots
+        }
+        self._discovery_results: dict[Path, ClaudeDiscoveryResult] = {}
+        self._sessions: dict[tuple[Path, str], SessionLifecycle] = {}
+        self._retired_terminal: set[tuple[Path, str]] = set()
+        self._transition_count = 0
 
     def run(self) -> int:
         self._install_signal_handlers()
-        self._persist_state()
+        self._persist_supervisor()
         try:
-            preflight = preflight_claude(self.claude_bin)
+            preflight = preflight_claude(self.claude_bin, config_dir=self.config_roots[0])
+            self.claude_bin = preflight.claude_bin
             self.record.provider_metadata.update(
-                {
-                    "claude_bin": preflight.claude_bin,
-                    "claude_version": preflight.version,
-                    "auth_method": preflight.auth_method,
-                    "auth_error": preflight.auth_error,
-                    "config_dir": str(preflight.config_dir),
-                    "cwd": str(self.cwd) if self.cwd is not None else "",
-                    "mode": "all",
-                }
+                {"claude_bin": preflight.claude_bin, "claude_version": preflight.version}
             )
-            self.logger.info("starting Claude discovery supervisor cwd=%s", self.cwd or "<all>")
+            self.record.keeper_status = "attached"
+            self._persist_supervisor()
+            self.logger.info(
+                "starting single Claude discovery supervisor roots=%s cwd=%s",
+                len(self.config_roots),
+                self.cwd or "<all>",
+            )
             while not self.stop_requested:
-                self._tick(preflight)
-                time.sleep(POLL_INTERVAL)
+                self.tick()
+                self._wait(self.local_state_interval)
             self.record.stop_reason = "signal"
             self.record.keeper_status = "stopping"
-            self._persist_state()
+            self._persist_supervisor()
             return 0
         except BaseException as exc:  # noqa: BLE001
             self.record.keeper_status = "error"
-            self.record.last_error = str(exc)
-            self._persist_state()
-            self.logger.exception("Claude discovery supervisor failed")
-            print(f"agent-keepalive error: {exc}", file=sys.stderr)
+            self.record.last_error = type(exc).__name__
+            self._persist_supervisor()
+            self.logger.error(
+                "Claude discovery supervisor failed error_type=%s", type(exc).__name__
+            )
+            print(f"agent-keepalive error: {type(exc).__name__}", file=sys.stderr)
             return 1
         finally:
+            self._remove_session_records()
             if self.record.keeper_status != "error":
                 self.store.remove("claude", "all")
 
-    def _tick(self, preflight: ClaudePreflight) -> None:
-        live_entries = list_live_entries(preflight.claude_bin, cwd=self.cwd)
-        live_short_ids = {
-            str(entry.get("sessionId", ""))[:8]
-            for entry in live_entries
-            if len(str(entry.get("sessionId", ""))[:8]) == 8
-        }
-        self._remove_stale_claude_records(live_short_ids)
-        self.record.target_status = "active" if live_entries else "idle"
-        self.record.event_count = len(live_entries)
-        self.record.last_event_at = utc_now().isoformat()
-        self.record.last_activity_at = self.record.last_event_at
-        self.record.provider_metadata["live_sessions"] = len(live_entries)
-        self._persist_state()
+    def tick(self, *, monotonic_now: float | None = None) -> None:
+        now_mono = time.monotonic() if monotonic_now is None else monotonic_now
+        for config_root in self.config_roots:
+            self._refresh_discovery_if_due(config_root, now_mono)
+            self._refresh_root_records(config_root, now_mono)
+        active = sum(
+            1
+            for lifecycle in self._sessions.values()
+            if lifecycle.missing_since is None and lifecycle.terminal_since is None
+        )
+        self.record.target_status = "active" if active else "idle"
+        self.record.event_count = self._transition_count
+        self.record.provider_metadata["visible_sessions"] = len(self._sessions)
+        self._persist_supervisor()
 
-        for entry in live_entries:
-            session_id = str(entry.get("sessionId", ""))
-            short_id = session_id[:8] if session_id else ""
-            if len(short_id) != 8:
-                continue
-            cwd = Path(str(entry.get("cwd", self.cwd or os.getcwd()))).resolve()
-            snapshot = observe_claude_entry(
-                preflight=preflight,
-                short_id=short_id,
-                cwd=cwd,
-                live_entry=entry,
-            )
-            skip_reason = self._supervision_skip_reason(snapshot)
-            if skip_reason is not None:
-                self._suppress_session(short_id, snapshot.status, skip_reason)
-                self._discard_dead_record(short_id)
-                continue
-
-            self._clear_suppression(short_id, snapshot.status)
-            existing = self.store.load("claude", short_id)
-            if existing and process_is_alive(existing.pid):
-                self._clear_child_failure_retry(short_id)
-                continue
-            if existing and existing.keeper_status == "error":
-                if not self._ready_to_retry_failed_child(short_id, existing.last_error):
-                    continue
-            elif existing is None and short_id in self._child_failure_counts:
-                if not self._ready_to_retry_failed_child(short_id, "could not start keeper"):
-                    continue
-            if existing:
-                self.store.remove("claude", short_id)
-            try:
-                self._spawn_keeper(short_id, cwd)
-            except OSError as exc:
-                self._schedule_child_failure_retry(short_id, f"could not spawn keeper: {exc}")
-
-        self._persist_state()
-
-    def _supervision_skip_reason(self, snapshot: Snapshot) -> str | None:
-        if snapshot.terminal:
-            return f"terminal Claude state {snapshot.status!r}"
-        if not snapshot.metadata.get("state_available"):
-            return "Claude job state metadata is unavailable"
-        if snapshot.blocked:
-            return "Claude session is blocked and waiting for its prerequisite"
-        if should_detach(snapshot, self.idle_timeout_seconds, now=utc_now()):
-            return (
-                f"Claude session is non-active and already exceeds the "
-                f"{self.idle_timeout_seconds}s idle timeout"
-            )
-        return None
-
-    def _suppress_session(self, short_id: str, status: str, reason: str) -> None:
-        current = {"status": status, "reason": reason}
-        if self._suppressed_sessions.get(short_id) == current:
+    def _refresh_discovery_if_due(self, config_root: Path, now_mono: float) -> None:
+        last = self._last_discovery_at.get(config_root)
+        if last is not None and now_mono - last < self.discovery_interval:
             return
-        self._suppressed_sessions[short_id] = current
-        self._sync_lifecycle_metadata()
-        if reason.startswith("terminal"):
-            self.logger.info(
-                "removing Claude session %s from supervision: %s",
-                short_id,
-                reason,
-            )
-        else:
-            self.logger.info(
-                "suppressing Claude keeper for session %s: %s; discovery will recheck it",
-                short_id,
-                reason,
-            )
-
-    def _clear_suppression(self, short_id: str, status: str) -> None:
-        previous = self._suppressed_sessions.pop(short_id, None)
-        if previous is None:
-            return
-        self._sync_lifecycle_metadata()
-        self.logger.info(
-            "Claude session %s became eligible again (status=%s; previous reason: %s)",
-            short_id,
-            status,
-            previous["reason"],
-        )
-
-    def _discard_dead_record(self, short_id: str) -> None:
-        existing = self.store.load("claude", short_id)
-        if existing and not process_is_alive(existing.pid):
-            self.store.remove("claude", short_id)
-
-    def _remove_stale_claude_records(self, live_short_ids: set[str]) -> None:
-        for record in self.store.list(provider="claude"):
-            if record.target_id == "all" or record.target_id in live_short_ids:
-                continue
-            if not process_is_alive(record.pid):
-                self.store.remove(record.provider, record.target_id)
-                self.logger.info(
-                    "removed stale Claude keeper state for session %s after it left discovery",
-                    record.target_id,
-                )
-
-    def _ready_to_retry_failed_child(self, short_id: str, error: str | None) -> bool:
-        now = time.monotonic()
-        retry_not_before = self._child_retry_not_before.get(short_id)
-        if retry_not_before is None:
-            self._schedule_child_failure_retry(short_id, error or "keeper exited with an unknown error")
-            return False
-        if now < retry_not_before:
-            return False
-        self._child_retry_not_before.pop(short_id, None)
-        self.logger.info("retrying Claude keeper for session %s after backoff", short_id)
-        return True
-
-    def _schedule_child_failure_retry(self, short_id: str, error: str) -> None:
-        attempt = self._child_failure_counts.get(short_id, 0) + 1
-        delay = min(
-            CHILD_FAILURE_RETRY_INITIAL_DELAY * (2 ** (attempt - 1)),
-            CHILD_FAILURE_RETRY_MAX_DELAY,
-        )
-        self._child_failure_counts[short_id] = attempt
-        self._child_retry_not_before[short_id] = time.monotonic() + delay
-        self._sync_lifecycle_metadata()
-        self.logger.warning(
-            "Claude keeper for session %s failed: %s; retrying in %gs (attempt %s)",
-            short_id,
-            error,
-            delay,
-            attempt,
-        )
-
-    def _clear_child_failure_retry(self, short_id: str) -> None:
-        if short_id not in self._child_failure_counts:
-            return
-        attempts = self._child_failure_counts.pop(short_id)
-        self._child_retry_not_before.pop(short_id, None)
-        self._sync_lifecycle_metadata()
-        self.logger.info(
-            "Claude keeper for session %s recovered after %s failed attempt(s)",
-            short_id,
-            attempts,
-        )
-
-    def _sync_lifecycle_metadata(self) -> None:
-        self.record.provider_metadata["suppressed_sessions"] = dict(self._suppressed_sessions)
-        self.record.provider_metadata["child_failure_retries"] = {
-            short_id: {"attempt": attempt}
-            for short_id, attempt in self._child_failure_counts.items()
-        }
-
-    def _spawn_keeper(self, short_id: str, cwd: Path) -> None:
-        self.logger.info("spawning Claude keeper for session %s cwd=%s", short_id, cwd)
-        child_env = child_environment()
-        child_log_path = self.paths.keeper_log_path("claude", short_id)
-        child_log_path.parent.mkdir(parents=True, exist_ok=True)
-        command = [
-            sys.executable,
-            "-m",
-            "agent_keepalive",
-            "run",
-            "claude",
-            "--session",
-            short_id,
-            "--claude-bin",
+        self._last_discovery_at[config_root] = now_mono
+        result = discover_claude(
             self.claude_bin,
-            "--idle-timeout",
-            self.idle_timeout,
-        ]
-        if cwd:
-            command.extend(["--cwd", str(cwd)])
-        command.extend(["--state-root", str(self.paths.state_root), "--selected-via", "all"])
-        with child_log_path.open("ab") as log_handle:
-            subprocess.Popen(  # noqa: S603
-                command,
-                cwd=os.getcwd(),
-                env=child_env,
-                start_new_session=True,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                close_fds=True,
+            config_dir=config_root,
+            cwd=self.cwd,
+        )
+        previous = self._discovery_results.get(config_root)
+        self._discovery_results[config_root] = result
+        if result.outcome in {"success", "empty"}:
+            entries: dict[str, dict[str, Any]] = {}
+            for entry in result.entries:
+                session_id = value_as_str(entry, "sessionId") or ""
+                candidate = (
+                    value_as_str(entry, "shortSessionId")
+                    or value_as_str(entry, "daemonShort")
+                    or session_id
+                )
+                try:
+                    short_id = short_session_id(candidate)
+                except ValueError:
+                    continue
+                entries[short_id] = entry
+            self._discovery_entries[config_root] = entries
+        self.record.provider_metadata["discovery"][str(config_root)] = {
+            "outcome": result.outcome,
+            "entry_count": len(result.entries),
+            "error": result.error,
+            "checked_at": utc_now().isoformat(),
+        }
+        if previous is None or (previous.outcome, previous.error) != (result.outcome, result.error):
+            level = logging.INFO if result.outcome in {"success", "empty"} else logging.WARNING
+            self.logger.log(
+                level,
+                "Claude discovery root=%s outcome=%s entries=%s%s",
+                config_root,
+                result.outcome,
+                len(result.entries),
+                f" error={result.error}" if result.error else "",
             )
 
-    def _persist_state(self) -> None:
+    def _refresh_root_records(self, config_root: Path, now_mono: float) -> None:
+        local_ids = self._local_job_ids(config_root)
+        live_entries = self._discovery_entries[config_root]
+        known_ids = {
+            short_id for root, short_id in self._sessions if root == config_root
+        }
+        candidates = local_ids | set(live_entries) | known_ids
+        discovery = self._discovery_results.get(config_root)
+        discovery_authoritative = discovery is not None and discovery.outcome in {"success", "empty"}
+
+        for short_id in sorted(candidates):
+            key = (config_root, short_id)
+            lifecycle = self._sessions.get(key)
+            if lifecycle is None:
+                lifecycle = SessionLifecycle(
+                    target_id=session_target_id(config_root, short_id),
+                    config_root=config_root,
+                    short_id=short_id,
+                )
+                self._sessions[key] = lifecycle
+
+            state_result = read_job_state(config_root, short_id)
+            live_entry = live_entries.get(short_id)
+            locally_present = state_result.outcome in {"ok", "invalid"}
+            if not locally_present and live_entry is None and discovery_authoritative:
+                if lifecycle.missing_since is None:
+                    lifecycle.missing_since = now_mono
+                    self._write_disappeared_record(lifecycle)
+                elif now_mono - lifecycle.missing_since >= self.disappearance_grace:
+                    self._remove_lifecycle(key, lifecycle, "disappearance grace expired")
+                continue
+
+            if live_entry is None and not locally_present and not discovery_authoritative:
+                continue
+
+            lifecycle.missing_since = None
+            snapshot = snapshot_from_claude_sources(
+                preflight=None,
+                short_id=short_id,
+                cwd=self._entry_cwd(config_root, live_entry, state_result),
+                state=state_result.payload,
+                live_entry=live_entry,
+                state_outcome=state_result.outcome,
+                config_dir=config_root,
+                claude_bin=self.claude_bin,
+            )
+            if key in self._retired_terminal:
+                if snapshot.terminal:
+                    self._sessions.pop(key, None)
+                    continue
+                self._retired_terminal.remove(key)
+            if snapshot.terminal:
+                if lifecycle.terminal_since is None:
+                    lifecycle.terminal_since = now_mono
+                elif now_mono - lifecycle.terminal_since >= self.terminal_grace:
+                    self._remove_lifecycle(key, lifecycle, "terminal grace expired")
+                    continue
+            else:
+                lifecycle.terminal_since = None
+            self._write_snapshot_record(lifecycle, snapshot, state_result)
+
+    def _local_job_ids(self, config_root: Path) -> set[str]:
+        jobs = config_root / "jobs"
+        try:
+            result = set()
+            for path in jobs.iterdir():
+                if not path.is_dir():
+                    continue
+                try:
+                    result.add(short_session_id(path.name))
+                except ValueError:
+                    continue
+            return result
+        except OSError:
+            return set()
+
+    def _entry_cwd(
+        self,
+        config_root: Path,
+        live_entry: dict[str, Any] | None,
+        state_result: JobStateResult,
+    ) -> Path:
+        raw = value_as_str(state_result.payload, "cwd") or value_as_str(live_entry, "cwd")
+        if raw:
+            try:
+                return Path(raw).resolve()
+            except (OSError, ValueError):
+                pass
+        return self.cwd or config_root
+
+    def _write_snapshot_record(self, lifecycle, snapshot, state_result: JobStateResult) -> None:
+        existing = self.store.load("claude", lifecycle.target_id)
+        record = existing or KeeperRecord.new(
+            provider="claude",
+            target_id=lifecycle.target_id,
+            pid=os.getpid(),
+            display_name=snapshot.display_name,
+            idle_timeout_seconds=0,
+            log_path=self.log_path,
+            selected_via="all",
+        )
+        record.pid = os.getpid()
+        record.keeper_status = "observed"
+        record.display_name = snapshot.display_name
+        record.target_status = snapshot.status
+        record.loaded = snapshot.loaded
+        record.blocked = snapshot.blocked
+        record.terminal = snapshot.terminal
+        record.last_activity_at = isoformat_or_none(snapshot.last_activity_at)
+        record.last_event_at = isoformat_or_none(snapshot.last_event_at)
+        record.idle_since = isoformat_or_none(snapshot.idle_since)
+        record.provider_metadata = {
+            **snapshot.metadata,
+            "managed_by_supervisor": True,
+            "supervisor_target": "all",
+            "source_root": str(lifecycle.config_root),
+            "root_fingerprint": root_fingerprint(lifecycle.config_root),
+            "state_outcome": state_result.outcome,
+        }
+        signature = (
+            snapshot.status,
+            snapshot.loaded,
+            snapshot.blocked,
+            snapshot.terminal,
+            record.last_activity_at,
+            state_result.outcome,
+            snapshot.display_name,
+            snapshot.metadata.get("session_id"),
+            snapshot.metadata.get("cwd"),
+            snapshot.metadata.get("live_status"),
+        )
+        changed = signature != lifecycle.signature
+        if changed:
+            previous = lifecycle.signature[0] if lifecycle.signature else "new"
+            lifecycle.signature = signature
+            record.event_count += 1
+            self._transition_count += 1
+            self.logger.info(
+                "Claude session %s root=%s transition %s -> %s state=%s",
+                lifecycle.short_id,
+                lifecycle.config_root,
+                previous,
+                snapshot.status,
+                state_result.outcome,
+            )
+        if existing is None or changed:
+            self.store.save(record)
+
+    def _write_disappeared_record(self, lifecycle: SessionLifecycle) -> None:
+        record = self.store.load("claude", lifecycle.target_id)
+        if record is None:
+            return
+        previous = record.target_status
+        record.keeper_status = "observed"
+        record.target_status = "disappeared"
+        record.loaded = False
+        record.blocked = False
+        record.terminal = False
+        record.provider_metadata.update(
+            {
+                "managed_by_supervisor": True,
+                "source_root": str(lifecycle.config_root),
+                "disappearance_grace_seconds": self.disappearance_grace,
+            }
+        )
+        lifecycle.signature = ("disappeared", False, False, False, record.last_activity_at, "missing")
+        record.event_count += 1
+        self._transition_count += 1
+        self.store.save(record)
+        self.logger.info(
+            "Claude session %s root=%s transition %s -> disappeared",
+            lifecycle.short_id,
+            lifecycle.config_root,
+            previous,
+        )
+
+    def _remove_lifecycle(self, key, lifecycle: SessionLifecycle, reason: str) -> None:
+        self.store.remove("claude", lifecycle.target_id)
+        self._sessions.pop(key, None)
+        if reason == "terminal grace expired":
+            self._retired_terminal.add(key)
+        self._transition_count += 1
+        self.logger.info(
+            "removed Claude session %s root=%s: %s",
+            lifecycle.short_id,
+            lifecycle.config_root,
+            reason,
+        )
+
+    def _persist_supervisor(self) -> None:
         self.store.save(self.record)
+
+    def _remove_session_records(self) -> None:
+        for lifecycle in list(self._sessions.values()):
+            self.store.remove("claude", lifecycle.target_id)
+        self._sessions.clear()
+
+    def _wait(self, delay: float) -> None:
+        deadline = time.monotonic() + delay
+        while not self.stop_requested:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.25))
 
     def _install_signal_handlers(self) -> None:
         def handler(signum: int, _frame) -> None:
+            if not self.stop_requested:
+                self.logger.info("received signal %s; stopping Claude discovery supervisor", signum)
             self.stop_requested = True
-            self.logger.info("received signal %s; stopping Claude discovery supervisor", signum)
 
         signal.signal(signal.SIGTERM, handler)
         signal.signal(signal.SIGINT, handler)
-
-
-def child_environment() -> dict[str, str]:
-    python_path_entries = [str(Path(__file__).resolve().parents[1])]
-    if os.environ.get("PYTHONPATH"):
-        python_path_entries.append(os.environ["PYTHONPATH"])
-    child_env = os.environ.copy()
-    child_env["PYTHONPATH"] = os.pathsep.join(python_path_entries)
-    return child_env

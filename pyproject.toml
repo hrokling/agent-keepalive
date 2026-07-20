@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-keepalive"
-version = "0.3.0"
+version = "0.3.1"
 description = "Keep remote coding-agent sessions observable and alive on long-lived hosts."
 readme = "README.md"
 requires-python = ">=3.11"

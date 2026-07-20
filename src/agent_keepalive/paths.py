@@ -29,6 +29,8 @@ class AppPaths:
     def ensure(self) -> None:
         self.keepers_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.keepers_dir.chmod(0o700)
+        self.logs_dir.chmod(0o700)
 
     def keeper_state_path(self, provider: str, target_id: str) -> Path:
         return self.keepers_dir / f"{provider}-{safe_target_id(target_id)}.json"
